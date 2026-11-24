@@ -1,0 +1,331 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { toEnglishDigits, toPersianDigits } from '../utils/formatters.js';
+
+export interface PersianCaptchaApiResponse {
+  ok?: boolean;
+  token?: string;
+  svg?: string;
+  expiresIn?: number;
+}
+
+export interface PersianCaptchaProps {
+  token: string;
+  onTokenChange: (token: string) => void;
+  code: string;
+  onCodeChange: (code: string) => void;
+  apiEndpoint?: string;
+  fetchCaptcha?: () => Promise<PersianCaptchaApiResponse>;
+  error?: string | null;
+  disabled?: boolean;
+  className?: string;
+  id?: string;
+  charCount?: number;
+  label?: string;
+  placeholder?: string;
+  loadingText?: string;
+  retryText?: string;
+}
+
+const RefreshIcon = ({ className = '' }: { className?: string }) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    width="18"
+    height="18"
+  >
+    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+    <path d="M3 3v5h5" />
+    <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+    <path d="M16 21h5v-5" />
+  </svg>
+);
+
+const ShieldIcon = ({ className = '' }: { className?: string }) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    width="18"
+    height="18"
+  >
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+    <path d="m9 12 2 2 4-4" />
+  </svg>
+);
+
+const AlertIcon = ({ className = '' }: { className?: string }) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+    width="16"
+    height="16"
+  >
+    <circle cx="12" cy="12" r="10" />
+    <line x1="12" y1="8" x2="12" y2="12" />
+    <line x1="12" y1="16" x2="12.01" y2="16" />
+  </svg>
+);
+
+export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
+  token,
+  onTokenChange,
+  code,
+  onCodeChange,
+  apiEndpoint = '/api/captcha',
+  fetchCaptcha,
+  error,
+  disabled = false,
+  className = '',
+  id = 'persian-captcha',
+  charCount = 6,
+  label = 'کد امنیتی (ارقام تصویر)',
+  placeholder = 'کد تصویر را وارد کنید',
+  loadingText = 'در حال بارگذاری...',
+  retryText = 'خطا در دریافت کد؛ کلیک برای تلاش مجدد',
+}) => {
+  const [svgContent, setSvgContent] = useState<string>('');
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [fetchError, setFetchError] = useState<boolean>(false);
+
+  const refreshCaptcha = useCallback(async () => {
+    setIsLoading(true);
+    setFetchError(false);
+    onCodeChange('');
+
+    try {
+      let data: PersianCaptchaApiResponse;
+      if (fetchCaptcha) {
+        data = await fetchCaptcha();
+      } else {
+        const res = await fetch(apiEndpoint, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          cache: 'no-store',
+        });
+        if (!res.ok) throw new Error('Failed to fetch captcha');
+        data = await res.json();
+      }
+
+      if (data && data.token && data.svg) {
+        onTokenChange(data.token);
+        setSvgContent(data.svg);
+      } else {
+        setFetchError(true);
+      }
+    } catch {
+      setFetchError(true);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [apiEndpoint, fetchCaptcha, onCodeChange, onTokenChange]);
+
+  useEffect(() => {
+    if (!token) {
+      refreshCaptcha();
+    }
+  }, [token, refreshCaptcha]);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const rawVal = e.target.value;
+    const digitsOnly = toEnglishDigits(rawVal).replace(/\D/g, '').slice(0, charCount);
+    onCodeChange(digitsOnly);
+  };
+
+  const displayedValue = toPersianDigits(code);
+
+  return (
+    <div
+      className={`pck-container ${className}`}
+      dir="rtl"
+      style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem', userSelect: 'none' }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <label
+          htmlFor={`${id}-input`}
+          style={{ fontSize: '0.875rem', fontWeight: 500, color: '#334155' }}
+        >
+          {label}
+        </label>
+        <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+          {toPersianDigits(charCount)} رقم
+        </span>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+        <div
+          style={{
+            position: 'relative',
+            flex: 1,
+            height: '54px',
+            borderRadius: '0.5rem',
+            border: '1px solid #cbd5e1',
+            backgroundColor: '#f8fafc',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            overflow: 'hidden',
+          }}
+          title="کد امنیتی فارسی"
+        >
+          {isLoading ? (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.5rem',
+                fontSize: '0.75rem',
+                color: '#64748b',
+              }}
+            >
+              <RefreshIcon className="pck-spin" />
+              <span>{loadingText}</span>
+            </div>
+          ) : fetchError ? (
+            <button
+              type="button"
+              onClick={refreshCaptcha}
+              style={{
+                background: 'none',
+                border: 'none',
+                cursor: 'pointer',
+                fontSize: '0.75rem',
+                color: '#dc2626',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '0.25rem',
+                fontWeight: 500,
+              }}
+            >
+              <AlertIcon />
+              <span>{retryText}</span>
+            </button>
+          ) : svgContent ? (
+            <div
+              style={{
+                width: '100%',
+                height: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                pointerEvents: 'none',
+              }}
+              dangerouslySetInnerHTML={{ __html: svgContent }}
+            />
+          ) : (
+            <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>تصویر بارگذاری نشد</span>
+          )}
+        </div>
+
+        <button
+          type="button"
+          onClick={refreshCaptcha}
+          disabled={disabled || isLoading}
+          aria-label="دریافت کد جدید"
+          title="بارگذاری مجدد تصویر کد امنیتی"
+          style={{
+            height: '54px',
+            width: '54px',
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            borderRadius: '0.5rem',
+            border: '1px solid #cbd5e1',
+            backgroundColor: '#ffffff',
+            color: '#475569',
+            cursor: disabled || isLoading ? 'not-allowed' : 'pointer',
+            opacity: disabled || isLoading ? 0.6 : 1,
+            transition: 'background-color 0.15s, border-color 0.15s',
+          }}
+        >
+          <RefreshIcon className={isLoading ? 'pck-spin' : ''} />
+        </button>
+      </div>
+
+      <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
+        <div
+          style={{
+            position: 'absolute',
+            right: '0.75rem',
+            pointerEvents: 'none',
+            display: 'flex',
+            alignItems: 'center',
+            color: '#94a3b8',
+          }}
+        >
+          <ShieldIcon />
+        </div>
+        <input
+          id={`${id}-input`}
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
+          maxLength={charCount}
+          disabled={disabled || isLoading}
+          value={displayedValue}
+          onChange={handleInputChange}
+          placeholder={placeholder}
+          style={{
+            width: '100%',
+            minHeight: '44px',
+            borderRadius: '0.5rem',
+            border: `1px solid ${error ? '#ef4444' : '#cbd5e1'}`,
+            backgroundColor: disabled ? '#f1f5f9' : '#ffffff',
+            paddingRight: '2.5rem',
+            paddingLeft: '0.75rem',
+            paddingTop: '0.5rem',
+            paddingBottom: '0.5rem',
+            fontSize: '0.95rem',
+            letterSpacing: '0.2em',
+            fontWeight: 700,
+            outline: 'none',
+            boxSizing: 'border-box',
+          }}
+        />
+      </div>
+
+      {error && (
+        <p
+          style={{
+            margin: 0,
+            fontSize: '0.75rem',
+            color: '#dc2626',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.25rem',
+          }}
+        >
+          <AlertIcon />
+          <span>{error}</span>
+        </p>
+      )}
+
+      <style>{`
+        @keyframes pck-spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        .pck-spin {
+          animation: pck-spin 1s linear infinite;
+        }
+      `}</style>
+    </div>
+  );
+};
