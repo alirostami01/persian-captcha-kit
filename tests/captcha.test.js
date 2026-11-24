@@ -523,9 +523,15 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
 
     // Map each master instance by its unique, authoritative Node ID (MYID)
     const masterNodeMap = new Map();
-    for (const m of masters) {
-      const myId = await m.cluster('MYID');
-      masterNodeMap.set(myId, m);
+    for (const master of masters) {
+      const myId = await master.cluster('MYID');
+
+      assert.ok(
+        !masterNodeMap.has(myId),
+        `Duplicate Redis master node ID detected: ${myId}`
+      );
+
+      masterNodeMap.set(myId, master);
     }
 
     // Ensure strict bi-directional 1:1 matching between connected masters and active shards
