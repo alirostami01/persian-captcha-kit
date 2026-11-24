@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import Redis from 'ioredis';
 import { JSDOM } from 'jsdom';
 import React, { act } from 'react';
@@ -30,7 +30,7 @@ const TEST_SECRET = 'a_very_secure_test_secret_key_with_at_least_32_characters_1
 
 // Single source of truth: Load Lua script from external fixture file
 const RECORD_ATTEMPT_LUA = fs.readFileSync(
-  path.resolve(process.cwd(), 'tests/fixtures/record-attempt.lua'),
+  fileURLToPath(new URL('fixtures/record-attempt.lua', import.meta.url)),
   'utf8'
 );
 
@@ -261,8 +261,7 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     return;
   }
 
-  const id = 'redis_test_' + Date.now();
-  const concurrentId = 'redis_concurrent_' + Date.now();
+  const createdTokenIds = new Set();
 
   try {
     const redisStore = {
@@ -296,6 +295,7 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
 
     const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
     const realId = captcha.token.split('.')[0];
+    createdTokenIds.add(realId);
 
     // 1. First attempt with wrong code
     const r1 = await verifyCaptchaToken(captcha.token, '000000', {
@@ -334,6 +334,8 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     // 4. Concurrency test on Real Redis: 5 parallel requests
     const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
     const concurrentRealId = concurrentCaptcha.token.split('.')[0];
+    createdTokenIds.add(concurrentRealId);
+
     const concurrentResults = await Promise.all([
       verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
       verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
@@ -346,24 +348,26 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     const liveAlreadyUsed = concurrentResults.filter((r) => r.error === 'ALREADY_USED').length;
     assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis');
     assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis');
-
-    // Add keys to cleanup
-    await redis.del(`captcha:{${realId}}:attempt`, `captcha:{${realId}}:consumed`);
-    await redis.del(`captcha:{${concurrentRealId}}:attempt`, `captcha:{${concurrentRealId}}:consumed`);
   } finally {
-    // Guaranteed cleanup in all paths (success or failure)
+    // Guaranteed cleanup of all real keys in finally, followed by guaranteed quit()
     try {
-      await redis.del(`captcha:{${id}}:attempt`, `captcha:{${id}}:consumed`);
-      await redis.del(`captcha:{${concurrentId}}:attempt`, `captcha:{${concurrentId}}:consumed`);
-      await redis.quit();
+      for (const tokenId of createdTokenIds) {
+        await redis.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`);
+      }
     } catch {
-      // Ignore cleanup error
+      // Ignore key deletion error
+    } finally {
+      try {
+        await redis.quit();
+      } catch {
+        // Ignore disconnect error
+      }
     }
   }
 });
 
 test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and CrossSlot Prevention', async () => {
-  // Test connection against the real 6-node Redis Cluster
+  const isClusterRequired = process.env.REQUIRE_REDIS_CLUSTER === 'true';
   let cluster;
   try {
     cluster = new Redis.Cluster(
@@ -373,7 +377,7 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
         { host: '127.0.0.1', port: 7002 },
       ],
       {
-        clusterRetryStrategy: () => null, // Don't hang if cluster not running
+        clusterRetryStrategy: () => null,
         enableReadyCheck: true,
         scaleReads: 'all',
         lazyConnect: true,
@@ -381,17 +385,19 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     );
     cluster.on('error', () => {});
     await cluster.connect();
-    // Ping to ensure cluster is actually ready and responsive
     await cluster.ping();
-  } catch {
+  } catch (err) {
     if (cluster) {
       try { cluster.disconnect(); } catch {}
     }
-    console.warn('[SKIP] Real Redis Cluster (ports 7000-7005) not running locally, skipping cluster proof test.');
+    if (isClusterRequired) {
+      throw new Error(`[FAIL] Redis Cluster connection required in CI but failed to connect on ports 7000-7002: ${err}`);
+    }
+    console.warn('[SKIP] Real Redis Cluster (ports 7000-7002) not running locally, skipping cluster proof test.');
     return;
   }
 
-  const clusterId = 'cluster_proof_' + Date.now();
+  const createdTokenIds = new Set();
 
   try {
     const clusterStore = {
@@ -424,10 +430,24 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
       },
     };
 
+    // 1. Verify Topology: At least 3 independent master nodes connected
+    const masters = cluster.nodes('master');
+    assert.ok(masters.length >= 3, `Redis Cluster must have at least 3 master nodes connected (found ${masters.length})`);
+
     const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
     const realId = captcha.token.split('.')[0];
+    createdTokenIds.add(realId);
 
-    // 1. First attempt with wrong code
+    // 2. Hash Slot Co-location Proof: Native Redis CLUSTER KEYSLOT validation
+    const slotAttempt = await cluster.cluster('KEYSLOT', `captcha:{${realId}}:attempt`);
+    const slotConsumed = await cluster.cluster('KEYSLOT', `captcha:{${realId}}:consumed`);
+    assert.equal(
+      slotAttempt,
+      slotConsumed,
+      `Both attempt and consumed keys for token {${realId}} MUST map to the exact same hash slot (${slotAttempt})`
+    );
+
+    // 3. First attempt with wrong code
     const r1 = await verifyCaptchaToken(captcha.token, '000000', {
       secret: TEST_SECRET,
       store: clusterStore,
@@ -441,7 +461,7 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     const attemptVal = await cluster.get(`captcha:{${realId}}:attempt`);
     assert.equal(attemptVal, '1');
 
-    // 2. Final attempt with correct code succeeds on cluster
+    // 4. Final attempt with correct code succeeds on cluster
     const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
       secret: TEST_SECRET,
       store: clusterStore,
@@ -449,7 +469,7 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     });
     assert.equal(r2.valid, true, 'Execution of atomic Lua on real Redis Cluster succeeds');
 
-    // 3. Subsequent replay attempt blocked on cluster
+    // 5. Subsequent replay attempt blocked on cluster
     const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
       secret: TEST_SECRET,
       store: clusterStore,
@@ -458,9 +478,11 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     assert.equal(r3.valid, false);
     assert.equal(r3.error, 'ALREADY_USED');
 
-    // 4. Parallel concurrency test across cluster nodes
+    // 6. Concurrency test across cluster
     const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
     const concurrentRealId = concurrentCaptcha.token.split('.')[0];
+    createdTokenIds.add(concurrentRealId);
+
     const concurrentResults = await Promise.all([
       verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
       verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
@@ -474,14 +496,45 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis Cluster');
     assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis Cluster');
 
-    await cluster.del(`captcha:{${realId}}:attempt`, `captcha:{${realId}}:consumed`);
-    await cluster.del(`captcha:{${concurrentRealId}}:attempt`, `captcha:{${concurrentRealId}}:consumed`);
+    // 7. Multi-Node Sharding Proof:
+    // Generate multiple distinct captchas and verify that keys distribute across multiple master nodes
+    const hitMasterNodes = new Set();
+    for (let i = 0; i < 20; i++) {
+      const shardedCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+      const shardedId = shardedCaptcha.token.split('.')[0];
+      createdTokenIds.add(shardedId);
+
+      const sAttempt = await cluster.cluster('KEYSLOT', `captcha:{${shardedId}}:attempt`);
+      const sConsumed = await cluster.cluster('KEYSLOT', `captcha:{${shardedId}}:consumed`);
+      assert.equal(sAttempt, sConsumed, 'Slot co-location must hold for all sharded keys');
+
+      // Execute atomic Lua on real cluster
+      const recordRes = await clusterStore.recordAttempt(shardedId, 3, 60);
+      assert.equal(recordRes.allowed, true);
+
+      // Identify serving master node
+      const [nodeAddress] = cluster.slots[sAttempt];
+      hitMasterNodes.add(nodeAddress);
+    }
+
+    assert.ok(
+      hitMasterNodes.size >= 3,
+      `Generated keys must distribute across all 3 master nodes (hit ${hitMasterNodes.size} masters: ${Array.from(hitMasterNodes).join(', ')})`
+    );
   } finally {
+    // Guaranteed cleanup of all real keys in finally, followed by guaranteed quit()
     try {
-      await cluster.del(`captcha:{${clusterId}}:attempt`, `captcha:{${clusterId}}:consumed`);
-      await cluster.quit();
+      for (const tokenId of createdTokenIds) {
+        await cluster.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`);
+      }
     } catch {
-      // Ignore cleanup error
+      // Ignore key deletion error
+    } finally {
+      try {
+        await cluster.quit();
+      } catch {
+        // Ignore disconnect error
+      }
     }
   }
 });

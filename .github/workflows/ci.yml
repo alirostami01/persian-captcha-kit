@@ -46,11 +46,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Start Redis Cluster
+        run: |
+          chmod +x scripts/start-redis-cluster.sh scripts/stop-redis-cluster.sh
+          ./scripts/start-redis-cluster.sh
+
       - name: Run Tests
         env:
           TEST_REDIS_PORT: 6379
           REQUIRE_REDIS: 'true'
+          REQUIRE_REDIS_CLUSTER: 'true'
         run: npm test
+
+      - name: Stop Redis Cluster
+        if: always()
+        run: ./scripts/stop-redis-cluster.sh
 
       - name: Verify package tarball
         run: npm pack --dry-run
