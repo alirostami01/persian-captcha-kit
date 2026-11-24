@@ -349,11 +349,13 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis');
     assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis');
   } finally {
-    // Guaranteed cleanup of all real keys in finally, followed by guaranteed quit()
+    // Guaranteed cleanup of all real keys in finally with isolated error handling per key
     try {
-      for (const tokenId of createdTokenIds) {
-        await redis.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`);
-      }
+      await Promise.allSettled(
+        Array.from(createdTokenIds).map((tokenId) =>
+          redis.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`)
+        )
+      );
     } catch {
       // Ignore key deletion error
     } finally {
@@ -430,9 +432,15 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
       },
     };
 
-    // 1. Verify Topology: At least 3 independent master nodes connected
+    // 1. Verify Topology and Explicit Cluster Health via CLUSTER INFO
     const masters = cluster.nodes('master');
     assert.ok(masters.length >= 3, `Redis Cluster must have at least 3 master nodes connected (found ${masters.length})`);
+
+    const infoStr = await cluster.cluster('INFO');
+    assert.match(infoStr, /cluster_state:ok/, 'Cluster state must be ok');
+    assert.match(infoStr, /cluster_slots_assigned:16384/, 'All 16384 slots must be assigned');
+    assert.match(infoStr, /cluster_slots_ok:16384/, 'All 16384 slots must be ok');
+    assert.match(infoStr, /cluster_slots_fail:0/, 'Zero cluster slots should be failed');
 
     const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
     const realId = captcha.token.split('.')[0];
@@ -497,9 +505,12 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis Cluster');
 
     // 7. Multi-Node Sharding Proof:
-    // Generate multiple distinct captchas and verify that keys distribute across multiple master nodes
+    // Generate captchas dynamically until keys deterministically distribute across every master node
     const hitMasterNodes = new Set();
-    for (let i = 0; i < 20; i++) {
+    const maxAttemptsToCover = 60;
+    let attemptsCount = 0;
+    while (hitMasterNodes.size < masters.length && attemptsCount < maxAttemptsToCover) {
+      attemptsCount++;
       const shardedCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
       const shardedId = shardedCaptcha.token.split('.')[0];
       createdTokenIds.add(shardedId);
@@ -517,16 +528,19 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
       hitMasterNodes.add(nodeAddress);
     }
 
-    assert.ok(
-      hitMasterNodes.size >= 3,
-      `Generated keys must distribute across all 3 master nodes (hit ${hitMasterNodes.size} masters: ${Array.from(hitMasterNodes).join(', ')})`
+    assert.equal(
+      hitMasterNodes.size,
+      masters.length,
+      `Generated keys must distribute across all ${masters.length} master nodes (hit ${hitMasterNodes.size} masters in ${attemptsCount} attempts: ${Array.from(hitMasterNodes).join(', ')})`
     );
   } finally {
-    // Guaranteed cleanup of all real keys in finally, followed by guaranteed quit()
+    // Guaranteed cleanup of all real keys in finally with isolated error handling per key
     try {
-      for (const tokenId of createdTokenIds) {
-        await cluster.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`);
-      }
+      await Promise.allSettled(
+        Array.from(createdTokenIds).map((tokenId) =>
+          cluster.del(`captcha:{${tokenId}}:attempt`, `captcha:{${tokenId}}:consumed`)
+        )
+      );
     } catch {
       // Ignore key deletion error
     } finally {
