@@ -35,7 +35,10 @@ echo "Waiting for Redis Cluster state to become OK..."
 CLUSTER_OK=0
 for attempt in $(seq 1 30); do
   INFO=$(docker exec redis-7000 redis-cli -p 7000 cluster info 2>/dev/null || true)
-  if echo "$INFO" | grep -q "cluster_state:ok" && echo "$INFO" | grep -q "cluster_slots_assigned:16384"; then
+  if echo "$INFO" | grep -q "cluster_state:ok" && \
+     echo "$INFO" | grep -q "cluster_slots_assigned:16384" && \
+     echo "$INFO" | grep -q "cluster_slots_ok:16384" && \
+     echo "$INFO" | grep -q "cluster_slots_fail:0"; then
     CLUSTER_OK=1
     break
   fi
