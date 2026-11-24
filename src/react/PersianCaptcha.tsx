@@ -111,6 +111,7 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
   const [fetchError, setFetchError] = useState<boolean>(false);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef<number>(0);
 
   const refreshCaptcha = useCallback(async () => {
     if (disabled) return;
@@ -120,6 +121,8 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
     }
     const controller = new AbortController();
     abortControllerRef.current = controller;
+
+    const currentRequestId = ++requestIdRef.current;
 
     setIsLoading(true);
     setFetchError(false);
@@ -140,20 +143,24 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
         data = await res.json();
       }
 
+      // Discard response if aborted or if a newer request was dispatched
+      if (controller.signal.aborted || currentRequestId !== requestIdRef.current) {
+        return;
+      }
+
       if (data && data.token && data.svg) {
         onTokenChange(data.token);
-        // Encode SVG to safe data URL to completely prevent HTML/DOM XSS injection
         const encodedSvg = `data:image/svg+xml;utf8,${encodeURIComponent(data.svg)}`;
         setSvgDataUrl(encodedSvg);
       } else {
         setFetchError(true);
       }
     } catch (err: unknown) {
-      if ((err as Error)?.name !== 'AbortError') {
+      if ((err as Error)?.name !== 'AbortError' && currentRequestId === requestIdRef.current) {
         setFetchError(true);
       }
     } finally {
-      if (abortControllerRef.current === controller) {
+      if (currentRequestId === requestIdRef.current) {
         setIsLoading(false);
       }
     }

@@ -65,7 +65,7 @@
     "dev": "tsup --watch",
     "test": "npm run build && node --test tests/**/*.test.js",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm test && npm run typecheck"
   },
   "peerDependencies": {
     "react": ">=18.0.0",

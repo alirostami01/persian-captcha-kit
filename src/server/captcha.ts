@@ -14,11 +14,14 @@ export type VerifyErrorCode =
   | 'INVALID_CODE'
   | 'EXPIRED'
   | 'ALREADY_USED'
-  | 'INVALID_TOKEN';
+  | 'TOO_MANY_ATTEMPTS'
+  | 'INVALID_TOKEN'
+  | 'STORE_ERROR';
 
 export interface VerifyResult {
   valid: boolean;
   error?: VerifyErrorCode;
+  attemptsRemaining?: number;
 }
 
 export interface GenerateCaptchaOptions {
@@ -32,6 +35,7 @@ export interface GenerateCaptchaOptions {
 export interface VerifyCaptchaOptions {
   secret?: string;
   store?: CaptchaStore;
+  maxAttempts?: number;
 }
 
 const PERSIAN_DIGITS = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '۹'];
@@ -42,15 +46,17 @@ const LINE_COLORS = ['#94a3b8', '#cbd5e1', '#a1a1aa', '#64748b', '#7dd3fc', '#86
 const TOKEN_REGEX = /^[a-f0-9]{32}\.\d{13}\.[a-f0-9]{64}$/;
 
 export function resolveSecretKey(customSecret?: string): string {
-  const secret = (customSecret || process.env.CAPTCHA_SECRET || process.env.AUTH_HMAC_KEY || '').trim();
-  if (!secret) {
+  const secret = customSecret ?? process.env.CAPTCHA_SECRET ?? process.env.AUTH_HMAC_KEY;
+  if (secret === undefined || secret === null || secret.trim() === '') {
     throw new Error(
       '[@persian-captcha-kit/server] CAPTCHA_SECRET is required. Please provide it via options or the CAPTCHA_SECRET environment variable.'
     );
   }
-  if (secret.length < 32) {
+
+  const byteLength = Buffer.byteLength(secret, 'utf8');
+  if (byteLength < 32) {
     throw new Error(
-      '[@persian-captcha-kit/server] CAPTCHA_SECRET must be at least 32 characters long to ensure cryptographic security.'
+      `[@persian-captcha-kit/server] CAPTCHA_SECRET must be at least 32 bytes long (currently ${byteLength} bytes) to ensure cryptographic security.`
     );
   }
   return secret;
@@ -69,7 +75,6 @@ function clamp(value: number, min: number, max: number, defaultValue: number): n
 export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult {
   const secretKey = resolveSecretKey(options?.secret);
 
-  // Validate and clamp configuration values to prevent arithmetic errors and DoS attacks
   const width = clamp(options?.width ?? 200, 120, 600, 200);
   const height = clamp(options?.height ?? 54, 36, 200, 54);
   const ttlSeconds = clamp(options?.ttlSeconds ?? 180, 30, 900, 180);
@@ -81,7 +86,6 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
   }
   const code = digits.join('');
 
-  // Generate random Bezier noise curves
   const lines: string[] = [];
   const lineCount = randomInt(3, 6);
   for (let i = 0; i < lineCount; i++) {
@@ -99,7 +103,6 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
     );
   }
 
-  // Generate random scatter noise dots
   const dots: string[] = [];
   const dotCount = randomInt(25, 40);
   for (let i = 0; i < dotCount; i++) {
@@ -111,7 +114,6 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
     dots.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}" opacity="${opacity}" />`);
   }
 
-  // Render Persian digit characters
   const charElements: string[] = [];
   const paddingX = Math.floor(width * 0.12);
   const stepX = (width - paddingX * 2) / Math.max(charCount - 1, 1);
@@ -138,7 +140,6 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
   const backgroundDots = dots.slice(0, halfDots).join('');
   const foregroundDots = dots.slice(halfDots).join('');
 
-  // Generate unique gradient ID to avoid collisions when multiple SVGs render on the same page
   const gradientId = `pck-bg-${randomBytes(4).toString('hex')}`;
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Persian Captcha Code">
@@ -172,7 +173,7 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
 }
 
 /**
- * Validates a submitted captcha token and user input against replay and timing attacks.
+ * Validates a submitted captcha token and user input against replay, brute-force, and timing attacks.
  */
 export async function verifyCaptchaToken(
   token: string | undefined | null,
@@ -181,12 +182,12 @@ export async function verifyCaptchaToken(
 ): Promise<VerifyResult> {
   const secretKey = resolveSecretKey(options?.secret);
   const store = options?.store || defaultMemoryStore;
+  const maxAttempts = clamp(options?.maxAttempts ?? 3, 1, 10, 3);
 
   if (!token || typeof token !== 'string') {
     return { valid: false, error: 'INVALID_TOKEN' };
   }
 
-  // Strict token format validation
   if (!TOKEN_REGEX.test(token)) {
     return { valid: false, error: 'INVALID_TOKEN' };
   }
@@ -194,12 +195,10 @@ export async function verifyCaptchaToken(
   const [id, expStr, sig] = token.split('.');
   const exp = parseInt(expStr, 10);
 
-  // Check expiration before further computation
   if (Date.now() > exp) {
     return { valid: false, error: 'EXPIRED' };
   }
 
-  // Normalize user digits input (supports Persian, Arabic, and Western digits)
   const normalizedInput = toEnglishDigits(userInput)
     .replace(/[\s\-_]/g, '')
     .trim();
@@ -208,7 +207,25 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_FORMAT' };
   }
 
-  // Verify HMAC signature in constant time before mutating state
+  const ttlSeconds = Math.max(1, Math.ceil((exp - Date.now()) / 1000));
+
+  // Check attempt quota atomically in store before evaluating password hash
+  let attemptResult;
+  try {
+    attemptResult = await store.recordAttempt(id, maxAttempts, ttlSeconds);
+  } catch {
+    return { valid: false, error: 'STORE_ERROR' };
+  }
+
+  if (attemptResult.consumed) {
+    return { valid: false, error: 'ALREADY_USED', attemptsRemaining: 0 };
+  }
+
+  if (!attemptResult.allowed) {
+    return { valid: false, error: 'TOO_MANY_ATTEMPTS', attemptsRemaining: 0 };
+  }
+
+  // Verify HMAC signature in constant time
   const expectedHmac = createHmac('sha256', secretKey)
     .update(`${id}:${expStr}:${normalizedInput}`)
     .digest('hex');
@@ -224,16 +241,22 @@ export async function verifyCaptchaToken(
   }
 
   if (!isSignatureValid) {
-    return { valid: false, error: 'INVALID_CODE' };
+    return {
+      valid: false,
+      error: 'INVALID_CODE',
+      attemptsRemaining: attemptResult.attemptsRemaining,
+    };
   }
 
-  // Atomically mark token as consumed to prevent replay attacks
-  const ttlSeconds = Math.max(1, Math.ceil((exp - Date.now()) / 1000));
-  const consumed = await store.markConsumed(id, ttlSeconds);
-
-  if (!consumed) {
-    return { valid: false, error: 'ALREADY_USED' };
+  // Atomically mark token as completely consumed upon success
+  try {
+    const consumed = await store.markConsumed(id, ttlSeconds);
+    if (!consumed) {
+      return { valid: false, error: 'ALREADY_USED', attemptsRemaining: 0 };
+    }
+  } catch {
+    return { valid: false, error: 'STORE_ERROR' };
   }
 
-  return { valid: true };
+  return { valid: true, attemptsRemaining: attemptResult.attemptsRemaining };
 }

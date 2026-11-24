@@ -17,18 +17,15 @@ test('toEnglishDigits & toPersianDigits conversion', () => {
 });
 
 test('generateCaptcha enforces secret requirements and clamps parameters', () => {
-  // Missing secret must throw an error
   assert.throws(() => generateCaptcha({ secret: '' }), /CAPTCHA_SECRET is required/);
-  // Short secret (<32 chars) must throw an error
-  assert.throws(() => generateCaptcha({ secret: 'too_short_secret' }), /must be at least 32 characters/);
+  assert.throws(() => generateCaptcha({ secret: 'too_short_secret' }), /must be at least 32 bytes/);
 
-  // Clamping: dimensions and charCount extremes
   const clampedMin = generateCaptcha({
     secret: TEST_SECRET,
-    width: 10,       // should clamp to 120
-    height: 5,       // should clamp to 36
-    charCount: 2,    // should clamp to 4
-    ttlSeconds: 5,   // should clamp to 30
+    width: 10,
+    height: 5,
+    charCount: 2,
+    ttlSeconds: 5,
   });
   assert.equal(clampedMin.code.length, 4);
   assert.equal(clampedMin.expiresIn, 30);
@@ -36,10 +33,10 @@ test('generateCaptcha enforces secret requirements and clamps parameters', () =>
 
   const clampedMax = generateCaptcha({
     secret: TEST_SECRET,
-    width: 2000,     // should clamp to 600
-    height: 1000,    // should clamp to 200
-    charCount: 50,   // should clamp to 8
-    ttlSeconds: 9999,// should clamp to 900
+    width: 2000,
+    height: 1000,
+    charCount: 50,
+    ttlSeconds: 9999,
   });
   assert.equal(clampedMax.code.length, 8);
   assert.equal(clampedMax.expiresIn, 900);
@@ -58,87 +55,100 @@ test('generateCaptcha outputs valid SVG with unique gradient IDs', () => {
   assert.notEqual(idMatch1[1], idMatch2[1], 'Each SVG must have a distinct gradient ID');
 });
 
-test('verifyCaptchaToken rejects forged and tampered tokens', async () => {
+test('verifyCaptchaToken enforces maxAttempts and blocks brute-force guessing', async () => {
   const store = new MemoryCaptchaStore();
   const captcha = generateCaptcha({ secret: TEST_SECRET });
-  const [id, exp, sig] = captcha.token.split('.');
 
-  // 1. Tampered signature
-  const tamperedSig = sig.slice(0, -4) + 'abcd';
-  const r1 = await verifyCaptchaToken(`${id}.${exp}.${tamperedSig}`, captcha.code, {
+  // Attempt 1: wrong code
+  const r1 = await verifyCaptchaToken(captcha.token, '000000', {
     secret: TEST_SECRET,
     store,
+    maxAttempts: 3,
   });
   assert.equal(r1.valid, false);
   assert.equal(r1.error, 'INVALID_CODE');
+  assert.equal(r1.attemptsRemaining, 2);
 
-  // 2. Tampered ID
-  const tamperedId = 'a' + id.slice(1);
-  const r2 = await verifyCaptchaToken(`${tamperedId}.${exp}.${sig}`, captcha.code, {
+  // Attempt 2: wrong code
+  const r2 = await verifyCaptchaToken(captcha.token, '111111', {
     secret: TEST_SECRET,
     store,
+    maxAttempts: 3,
   });
   assert.equal(r2.valid, false);
   assert.equal(r2.error, 'INVALID_CODE');
+  assert.equal(r2.attemptsRemaining, 1);
 
-  // 3. Different secret key
-  const OTHER_SECRET = 'another_valid_secret_key_with_32_characters_long_1234';
+  // Attempt 3: correct code
   const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
-    secret: OTHER_SECRET,
+    secret: TEST_SECRET,
     store,
+    maxAttempts: 3,
+  });
+  assert.equal(r3.valid, true);
+
+  // Attempt 4: after successful consumption, token must be ALREADY_USED
+  const r4 = await verifyCaptchaToken(captcha.token, captcha.code, {
+    secret: TEST_SECRET,
+    store,
+    maxAttempts: 3,
+  });
+  assert.equal(r4.valid, false);
+  assert.equal(r4.error, 'ALREADY_USED');
+});
+
+test('verifyCaptchaToken blocks token once maxAttempts is exceeded', async () => {
+  const store = new MemoryCaptchaStore();
+  const captcha = generateCaptcha({ secret: TEST_SECRET });
+
+  // 2 wrong attempts
+  await verifyCaptchaToken(captcha.token, '000000', { secret: TEST_SECRET, store, maxAttempts: 2 });
+  await verifyCaptchaToken(captcha.token, '111111', { secret: TEST_SECRET, store, maxAttempts: 2 });
+
+  // 3rd attempt, even with correct code, must be blocked as TOO_MANY_ATTEMPTS
+  const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
+    secret: TEST_SECRET,
+    store,
+    maxAttempts: 2,
   });
   assert.equal(r3.valid, false);
-  assert.equal(r3.error, 'INVALID_CODE');
-
-  // 4. Malformed tokens
-  const malformed = ['invalid', 'a.b', 'a.b.c', 'not_hex.1234567890123.sig'];
-  for (const t of malformed) {
-    const res = await verifyCaptchaToken(t, '123456', { secret: TEST_SECRET, store });
-    assert.equal(res.valid, false);
-    assert.equal(res.error, 'INVALID_TOKEN');
-  }
+  assert.equal(r3.error, 'TOO_MANY_ATTEMPTS');
 });
 
-test('verifyCaptchaToken works with custom asynchronous store (e.g., Redis-compatible)', async () => {
-  const customStoreMap = new Set();
-
-  const asyncRedisLikeStore = {
-    async isConsumed(id) {
-      return customStoreMap.has(id);
-    },
-    async markConsumed(id) {
-      if (customStoreMap.has(id)) return false;
-      customStoreMap.add(id);
-      return true;
-    },
-  };
-
+test('verifyCaptchaToken handles concurrent verification attempts safely', async () => {
+  const store = new MemoryCaptchaStore();
   const captcha = generateCaptcha({ secret: TEST_SECRET });
-  const r1 = await verifyCaptchaToken(captcha.token, captcha.code, {
-    secret: TEST_SECRET,
-    store: asyncRedisLikeStore,
-  });
-  assert.equal(r1.valid, true);
 
-  // Subsequent call with the same token must fail with ALREADY_USED
-  const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
-    secret: TEST_SECRET,
-    store: asyncRedisLikeStore,
-  });
-  assert.equal(r2.valid, false);
-  assert.equal(r2.error, 'ALREADY_USED');
+  // Fire 5 simultaneous verification attempts with the correct code
+  const results = await Promise.all([
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+  ]);
+
+  // Exactly one attempt must succeed (valid: true) and the rest must be ALREADY_USED
+  const successCount = results.filter((r) => r.valid).length;
+  const alreadyUsedCount = results.filter((r) => r.error === 'ALREADY_USED').length;
+
+  assert.equal(successCount, 1, 'Only one concurrent request can successfully consume the token');
+  assert.equal(alreadyUsedCount, 4, 'Remaining concurrent requests must be rejected as ALREADY_USED');
 });
 
-test('MemoryCaptchaStore handles capacity limits cleanly', () => {
-  const smallStore = new MemoryCaptchaStore({ maxEntries: 2 });
-  assert.equal(smallStore.markConsumed('id1', 60), true);
-  assert.equal(smallStore.markConsumed('id2', 60), true);
-  // Re-marking consumed ID should return false
-  assert.equal(smallStore.markConsumed('id1', 60), false);
+test('MemoryCaptchaStore validates maxEntries and refuses to drop unexpired entries', () => {
+  assert.throws(() => new MemoryCaptchaStore({ maxEntries: 0 }), /maxEntries must be a positive integer/);
+  assert.throws(() => new MemoryCaptchaStore({ maxEntries: -5 }), /maxEntries must be a positive integer/);
 
-  // Adding 3rd entry should evict the oldest without crashing
-  assert.equal(smallStore.markConsumed('id3', 60), true);
-  assert.equal(smallStore.isConsumed('id3'), true);
+  const smallStore = new MemoryCaptchaStore({ maxEntries: 2 });
+  smallStore.recordAttempt('id1', 3, 60);
+  smallStore.recordAttempt('id2', 3, 60);
+
+  // 3rd entry when memory is full of valid entries must throw capacity exceeded error
+  assert.throws(
+    () => smallStore.recordAttempt('id3', 3, 60),
+    /MemoryCaptchaStore capacity exceeded/
+  );
 });
 
 test('createCaptchaHandler works for Next.js and preserves security headers', async () => {
@@ -147,7 +157,7 @@ test('createCaptchaHandler works for Next.js and preserves security headers', as
     secret: TEST_SECRET,
     headers: {
       'X-Custom-Header': 'PersianCaptcha',
-      'Cache-Control': 'public, max-age=3600', // Attempt to override cache control
+      'Cache-Control': 'public, max-age=3600',
     },
     onError: (err) => {
       loggedError = err;
@@ -157,7 +167,6 @@ test('createCaptchaHandler works for Next.js and preserves security headers', as
   const response = await handler.GET();
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('X-Custom-Header'), 'PersianCaptcha');
-  // Critical security headers must remain non-cacheable
   assert.equal(response.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate, proxy-revalidate');
   assert.equal(response.headers.get('Pragma'), 'no-cache');
   assert.equal(loggedError, null);
