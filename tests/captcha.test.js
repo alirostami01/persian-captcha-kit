@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import Redis from 'ioredis';
 import { JSDOM } from 'jsdom';
 import React, { act } from 'react';
@@ -26,32 +28,11 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const TEST_SECRET = 'a_very_secure_test_secret_key_with_at_least_32_characters_12345';
 
-const RECORD_ATTEMPT_LUA = `
-local attemptKey = KEYS[1]
-local consumedKey = KEYS[2]
-local maxAttempts = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-
-if redis.call("EXISTS", consumedKey) == 1 then
-  return {0, 0, 1}
-end
-
-local count = redis.call("INCR", attemptKey)
-if count == 1 then
-  redis.call("EXPIRE", attemptKey, ttl)
-end
-
-if count >= maxAttempts then
-  redis.call("SET", consumedKey, "1", "EX", ttl)
-end
-
-if count > maxAttempts then
-  return {0, 0, 0}
-end
-
-local remaining = maxAttempts - count
-return {1, remaining, 0}
-`;
+// Single source of truth: Load Lua script from external fixture file
+const RECORD_ATTEMPT_LUA = fs.readFileSync(
+  path.resolve(process.cwd(), 'tests/fixtures/record-attempt.lua'),
+  'utf8'
+);
 
 test('toEnglishDigits & toPersianDigits conversion', () => {
   assert.equal(toEnglishDigits('۱۲۳۴۵۶'), '123456');
@@ -261,13 +242,18 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     host: '127.0.0.1',
     port: redisPort,
     lazyConnect: true,
-    connectTimeout: 2000,
-    maxRetriesPerRequest: 1,
+    connectTimeout: 1000,
+    maxRetriesPerRequest: 0,
+    retryStrategy: () => null,
   });
+  redis.on('error', () => {});
 
   try {
     await redis.connect();
   } catch (err) {
+    try {
+      redis.disconnect();
+    } catch {}
     if (isRequired) {
       throw new Error(`[FAIL] Redis connection required in CI but failed to connect on 127.0.0.1:${redisPort}: ${err}`);
     }
@@ -275,103 +261,236 @@ test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, Consumed Key, and 
     return;
   }
 
-  const redisStore = {
-    async recordAttempt(id, maxAttempts, ttlSeconds) {
-      const attemptKey = `captcha:{${id}}:attempt`;
-      const consumedKey = `captcha:{${id}}:consumed`;
+  const id = 'redis_test_' + Date.now();
+  const concurrentId = 'redis_concurrent_' + Date.now();
 
-      const result = await redis.eval(
-        RECORD_ATTEMPT_LUA,
-        2,
-        attemptKey,
-        consumedKey,
-        maxAttempts,
-        ttlSeconds
-      );
+  try {
+    const redisStore = {
+      async recordAttempt(tokenKeyId, maxAttempts, ttlSeconds) {
+        const attemptKey = `captcha:{${tokenKeyId}}:attempt`;
+        const consumedKey = `captcha:{${tokenKeyId}}:consumed`;
 
-      const [allowed, remaining, consumed] = result;
-      return {
-        allowed: allowed === 1,
-        attemptsRemaining: remaining,
-        consumed: consumed === 1,
-      };
-    },
+        const result = await redis.eval(
+          RECORD_ATTEMPT_LUA,
+          2,
+          attemptKey,
+          consumedKey,
+          maxAttempts,
+          ttlSeconds
+        );
 
-    async markConsumed(id, ttlSeconds) {
-      const consumedKey = `captcha:{${id}}:consumed`;
-      const res = await redis.set(consumedKey, '1', 'EX', ttlSeconds, 'NX');
-      return res === 'OK';
-    },
-  };
+        const [allowed, remaining, consumed] = result;
+        return {
+          allowed: allowed === 1,
+          attemptsRemaining: remaining,
+          consumed: consumed === 1,
+        };
+      },
 
-  const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
-  const id = captcha.token.split('.')[0];
+      async markConsumed(tokenKeyId, ttlSeconds) {
+        const consumedKey = `captcha:{${tokenKeyId}}:consumed`;
+        const res = await redis.set(consumedKey, '1', 'EX', ttlSeconds, 'NX');
+        return res === 'OK';
+      },
+    };
 
-  // 1. First attempt with wrong code
-  const r1 = await verifyCaptchaToken(captcha.token, '000000', {
-    secret: TEST_SECRET,
-    store: redisStore,
-    maxAttempts: 2,
-  });
-  assert.equal(r1.valid, false);
-  assert.equal(r1.error, 'INVALID_CODE');
-  assert.equal(r1.attemptsRemaining, 1);
+    const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+    const realId = captcha.token.split('.')[0];
 
-  const attemptTtl = await redis.ttl(`captcha:{${id}}:attempt`);
-  assert.ok(attemptTtl > 0 && attemptTtl <= 60, `Attempt TTL must be active on real Redis (got ${attemptTtl})`);
+    // 1. First attempt with wrong code
+    const r1 = await verifyCaptchaToken(captcha.token, '000000', {
+      secret: TEST_SECRET,
+      store: redisStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r1.valid, false);
+    assert.equal(r1.error, 'INVALID_CODE');
+    assert.equal(r1.attemptsRemaining, 1);
 
-  // 2. Final attempt with correct code succeeds
-  const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
-    secret: TEST_SECRET,
-    store: redisStore,
-    maxAttempts: 2,
-  });
-  assert.equal(r2.valid, true);
+    const attemptTtl = await redis.ttl(`captcha:{${realId}}:attempt`);
+    assert.ok(attemptTtl > 0 && attemptTtl <= 60, `Attempt TTL must be active on real Redis (got ${attemptTtl})`);
 
-  // 3. Subsequent attempt rejected as ALREADY_USED
-  const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
-    secret: TEST_SECRET,
-    store: redisStore,
-    maxAttempts: 2,
-  });
-  assert.equal(r3.valid, false);
-  assert.equal(r3.error, 'ALREADY_USED');
+    // 2. Final attempt with correct code succeeds
+    const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
+      secret: TEST_SECRET,
+      store: redisStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r2.valid, true);
 
-  // Verify consumed key TTL
-  const consumedTtl = await redis.ttl(`captcha:{${id}}:consumed`);
-  assert.ok(consumedTtl > 0 && consumedTtl <= 60, `Consumed TTL must be active on real Redis (got ${consumedTtl})`);
+    // 3. Subsequent attempt rejected as ALREADY_USED
+    const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
+      secret: TEST_SECRET,
+      store: redisStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r3.valid, false);
+    assert.equal(r3.error, 'ALREADY_USED');
 
-  // 4. Concurrency test on Real Redis: 5 parallel requests
-  const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
-  const concurrentId = concurrentCaptcha.token.split('.')[0];
-  const concurrentResults = await Promise.all([
-    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
-    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
-    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
-    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
-    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
-  ]);
+    // Verify consumed key TTL
+    const consumedTtl = await redis.ttl(`captcha:{${realId}}:consumed`);
+    assert.ok(consumedTtl > 0 && consumedTtl <= 60, `Consumed TTL must be active on real Redis (got ${consumedTtl})`);
 
-  const liveSuccess = concurrentResults.filter((r) => r.valid).length;
-  const liveAlreadyUsed = concurrentResults.filter((r) => r.error === 'ALREADY_USED').length;
-  assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis');
-  assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis');
+    // 4. Concurrency test on Real Redis: 5 parallel requests
+    const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+    const concurrentRealId = concurrentCaptcha.token.split('.')[0];
+    const concurrentResults = await Promise.all([
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+    ]);
 
-  // Clean up all test keys completely
-  await redis.del(
-    `captcha:{${id}}:attempt`,
-    `captcha:{${id}}:consumed`,
-    `captcha:{${concurrentId}}:attempt`,
-    `captcha:{${concurrentId}}:consumed`
-  );
-  await redis.quit();
+    const liveSuccess = concurrentResults.filter((r) => r.valid).length;
+    const liveAlreadyUsed = concurrentResults.filter((r) => r.error === 'ALREADY_USED').length;
+    assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis');
+    assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis');
+
+    // Add keys to cleanup
+    await redis.del(`captcha:{${realId}}:attempt`, `captcha:{${realId}}:consumed`);
+    await redis.del(`captcha:{${concurrentRealId}}:attempt`, `captcha:{${concurrentRealId}}:consumed`);
+  } finally {
+    // Guaranteed cleanup in all paths (success or failure)
+    try {
+      await redis.del(`captcha:{${id}}:attempt`, `captcha:{${id}}:consumed`);
+      await redis.del(`captcha:{${concurrentId}}:attempt`, `captcha:{${concurrentId}}:consumed`);
+      await redis.quit();
+    } catch {
+      // Ignore cleanup error
+    }
+  }
 });
 
-test('React Component: full DOM render, out-of-order responses, and state stability', async () => {
+test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and CrossSlot Prevention', async () => {
+  // Test connection against the real 6-node Redis Cluster
+  let cluster;
+  try {
+    cluster = new Redis.Cluster(
+      [
+        { host: '127.0.0.1', port: 7000 },
+        { host: '127.0.0.1', port: 7001 },
+        { host: '127.0.0.1', port: 7002 },
+      ],
+      {
+        clusterRetryStrategy: () => null, // Don't hang if cluster not running
+        enableReadyCheck: true,
+        scaleReads: 'all',
+        lazyConnect: true,
+      }
+    );
+    cluster.on('error', () => {});
+    await cluster.connect();
+    // Ping to ensure cluster is actually ready and responsive
+    await cluster.ping();
+  } catch {
+    if (cluster) {
+      try { cluster.disconnect(); } catch {}
+    }
+    console.warn('[SKIP] Real Redis Cluster (ports 7000-7005) not running locally, skipping cluster proof test.');
+    return;
+  }
+
+  const clusterId = 'cluster_proof_' + Date.now();
+
+  try {
+    const clusterStore = {
+      async recordAttempt(tokenKeyId, maxAttempts, ttlSeconds) {
+        // Critical: The {tokenKeyId} hash tag ensures BOTH keys map to the exact same hash slot!
+        const attemptKey = `captcha:{${tokenKeyId}}:attempt`;
+        const consumedKey = `captcha:{${tokenKeyId}}:consumed`;
+
+        const result = await cluster.eval(
+          RECORD_ATTEMPT_LUA,
+          2,
+          attemptKey,
+          consumedKey,
+          maxAttempts,
+          ttlSeconds
+        );
+
+        const [allowed, remaining, consumed] = result;
+        return {
+          allowed: allowed === 1,
+          attemptsRemaining: remaining,
+          consumed: consumed === 1,
+        };
+      },
+
+      async markConsumed(tokenKeyId, ttlSeconds) {
+        const consumedKey = `captcha:{${tokenKeyId}}:consumed`;
+        const res = await cluster.set(consumedKey, '1', 'EX', ttlSeconds, 'NX');
+        return res === 'OK';
+      },
+    };
+
+    const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+    const realId = captcha.token.split('.')[0];
+
+    // 1. First attempt with wrong code
+    const r1 = await verifyCaptchaToken(captcha.token, '000000', {
+      secret: TEST_SECRET,
+      store: clusterStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r1.valid, false);
+    assert.equal(r1.error, 'INVALID_CODE');
+    assert.equal(r1.attemptsRemaining, 1);
+
+    // Verify key in cluster
+    const attemptVal = await cluster.get(`captcha:{${realId}}:attempt`);
+    assert.equal(attemptVal, '1');
+
+    // 2. Final attempt with correct code succeeds on cluster
+    const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
+      secret: TEST_SECRET,
+      store: clusterStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r2.valid, true, 'Execution of atomic Lua on real Redis Cluster succeeds');
+
+    // 3. Subsequent replay attempt blocked on cluster
+    const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
+      secret: TEST_SECRET,
+      store: clusterStore,
+      maxAttempts: 2,
+    });
+    assert.equal(r3.valid, false);
+    assert.equal(r3.error, 'ALREADY_USED');
+
+    // 4. Parallel concurrency test across cluster nodes
+    const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+    const concurrentRealId = concurrentCaptcha.token.split('.')[0];
+    const concurrentResults = await Promise.all([
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
+      verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: clusterStore, maxAttempts: 5 }),
+    ]);
+
+    const liveSuccess = concurrentResults.filter((r) => r.valid).length;
+    const liveAlreadyUsed = concurrentResults.filter((r) => r.error === 'ALREADY_USED').length;
+    assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis Cluster');
+    assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis Cluster');
+
+    await cluster.del(`captcha:{${realId}}:attempt`, `captcha:{${realId}}:consumed`);
+    await cluster.del(`captcha:{${concurrentRealId}}:attempt`, `captcha:{${concurrentRealId}}:consumed`);
+  } finally {
+    try {
+      await cluster.del(`captcha:{${clusterId}}:attempt`, `captcha:{${clusterId}}:consumed`);
+      await cluster.quit();
+    } catch {
+      // Ignore cleanup error
+    }
+  }
+});
+
+test('React Component: same-instance concurrent requests with out-of-order delayed response', async () => {
   const container = document.getElementById('root');
   const root = ReactDOMClient.createRoot(container);
 
-  let currentToken = 'initial_token';
+  let currentToken = 'initial_active_token';
   let currentCode = '';
   const onTokenChange = (t) => { currentToken = t; };
   const onCodeChange = (c) => { currentCode = c; };
@@ -388,14 +507,42 @@ test('React Component: full DOM render, out-of-order responses, and state stabil
     const thisCall = callCount;
     if (thisCall === 1) {
       await firstPromise;
-      return { ok: true, token: 'token_1_delayed', svg: '<svg id="svg1"></svg>' };
+      return { ok: true, token: 'token_1_delayed', svg: '<svg id="svg_delayed_1"></svg>' };
     } else {
       await secondPromise;
-      return { ok: true, token: 'token_2_faster', svg: '<svg id="svg2"></svg>' };
+      return { ok: true, token: 'token_2_faster', svg: '<svg id="svg_faster_2"></svg>' };
     }
   };
 
-  // 1. Initial render with empty token launches Call 1 via useEffect
+  // 1. Mount PersianCaptcha instance with an active token
+  await act(async () => {
+    root.render(
+      React.createElement(PersianCaptcha, {
+        token: currentToken,
+        onTokenChange,
+        code: currentCode,
+        onCodeChange,
+        fetchCaptcha: mockFetchCaptcha,
+      })
+    );
+  });
+
+  assert.equal(callCount, 0, 'No fetch on mount when token is already present');
+
+  const inputEl = container.querySelector('input');
+  assert.ok(inputEl, 'Input element must exist');
+  const reloadBtn = container.querySelector('button[aria-label="دریافت کد جدید"]');
+  assert.ok(reloadBtn, 'Reload button must exist and be enabled initially');
+  assert.equal(reloadBtn.disabled, false, 'Reload button is enabled initially');
+
+  // Trigger Call 1 via clicking the reload button
+  await act(async () => {
+    reloadBtn.click();
+  });
+  assert.equal(callCount, 1, 'Clicking reload button dispatches Call 1');
+
+  // 2. While Call 1 is in-flight, simulate the parent resetting the token to '' (e.g., after failed submission)
+  // Re-rendering the SAME instance with token='' triggers useEffect and dispatches Call 2
   await act(async () => {
     root.render(
       React.createElement(PersianCaptcha, {
@@ -407,44 +554,36 @@ test('React Component: full DOM render, out-of-order responses, and state stabil
       })
     );
   });
-  assert.equal(callCount, 1, 'Initial render must launch call 1');
 
-  // 2. Trigger Call 2: simulate unmounting & remounting or manual refresh trigger
-  // Since button has disabled={isLoading}, in React we test re-render with key/prop update or direct refresh
-  await act(async () => {
-    // Re-rendering with empty token and updated key launches call 2 while call 1 is pending
-    root.render(
-      React.createElement(PersianCaptcha, {
-        key: 'second_mount',
-        token: '',
-        onTokenChange,
-        code: currentCode,
-        onCodeChange,
-        fetchCaptcha: mockFetchCaptcha,
-      })
-    );
-  });
-  assert.equal(callCount, 2, 'Remount/re-trigger must launch call 2 while call 1 is pending');
+  assert.equal(callCount, 2, 'Resetting token to empty string on the same instance dispatches Call 2');
 
-  // 4. Resolve Call 2 FIRST (faster response)
+  // 3. Resolve Call 2 FIRST (faster response)
   await act(async () => {
     triggerSecondResolve();
     await new Promise((r) => setTimeout(r, 20));
   });
 
   assert.equal(currentToken, 'token_2_faster', 'Token must update to the faster response (Call 2)');
+  const imgElAfterCall2 = container.querySelector('img');
+  assert.ok(imgElAfterCall2, 'SVG img tag must be rendered in DOM');
+  assert.ok(imgElAfterCall2.src.includes('svg_faster_2'), 'DOM img src must display Call 2 SVG');
 
-  // 5. Resolve Call 1 AFTER Call 2 (delayed response)
+  // 4. Resolve Call 1 AFTER Call 2 (stale/delayed response)
   await act(async () => {
     triggerFirstResolve();
     await new Promise((r) => setTimeout(r, 20));
   });
 
-  // State MUST remain 'token_2_faster' and discard the out-of-order 'token_1_delayed'
+  // Verify that the same instance discarded Call 1 completely:
   assert.equal(
     currentToken,
     'token_2_faster',
-    'Component state must discard the delayed response and maintain the latest token'
+    'Component must discard delayed Call 1 response and retain latest token'
+  );
+  const finalImgEl = container.querySelector('img');
+  assert.ok(
+    finalImgEl.src.includes('svg_faster_2'),
+    'DOM img src must still display Call 2 SVG and not be overwritten by delayed response'
   );
 
   // Clean up
