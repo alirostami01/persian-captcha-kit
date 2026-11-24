@@ -1,18 +1,18 @@
 export interface CaptchaStore {
   /**
-   * بررسی می‌کند که آیا این توکن قبلاً مصرف شده است یا خیر.
+   * Checks whether the given token ID has already been consumed.
    */
   isConsumed(id: string): Promise<boolean> | boolean;
 
   /**
-   * توکن را به عنوان مصرف‌شده ثبت می‌کند.
-   * در صورت موفقیت‌آمیز بودن ثبت اتمیک true و در صورتی که توکن قبلاً ثبت شده باشد false برمی‌گرداند.
+   * Atomically marks the token ID as consumed.
+   * Returns true if successfully registered, or false if already marked.
    */
   markConsumed(id: string, ttlSeconds: number): Promise<boolean> | boolean;
 }
 
 /**
- * پیاده‌سازی ذخیره‌ساز در حافظه (Memory Store) همراه با سقف ظرفیت برای جلوگیری از DoS
+ * In-memory storage implementation with size limits to prevent DoS attacks.
  */
 export class MemoryCaptchaStore implements CaptchaStore {
   private consumed = new Map<string, number>();
@@ -42,16 +42,13 @@ export class MemoryCaptchaStore implements CaptchaStore {
 
   markConsumed(id: string, ttlSeconds: number): boolean {
     const now = Date.now();
-    
-    // اگر از قبل وجود داشت و منقضی نشده بود
+
     if (this.isConsumed(id)) {
       return false;
     }
 
-    // کنترل سقف تعداد رکوردها برای محافظت از حافظه
     if (this.consumed.size >= this.maxEntries) {
       this.cleanup(now);
-      // اگر بعد از پاکسازی هنوز پر بود، قدیمی‌ترین رکورد حذف شود
       if (this.consumed.size >= this.maxEntries) {
         const firstKey = this.consumed.keys().next().value;
         if (firstKey) this.consumed.delete(firstKey);

@@ -1,3 +1,6 @@
+/**
+ * Converts Persian and Arabic digits to standard Latin (ASCII) digits.
+ */
 export const toEnglishDigits = (input: string | number | null | undefined): string => {
   if (input === null || input === undefined) return '';
   return String(input)
@@ -5,6 +8,9 @@ export const toEnglishDigits = (input: string | number | null | undefined): stri
     .replace(/[٠-٩]/g, (char) => String(char.charCodeAt(0) - 1632));
 };
 
+/**
+ * Converts Latin digits to Persian digits.
+ */
 export const toPersianDigits = (input: string | number | null | undefined): string => {
   if (input === null || input === undefined) return '';
   const str = String(input);

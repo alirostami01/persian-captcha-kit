@@ -38,14 +38,14 @@ const PERSIAN_DIGITS = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '�
 const TEXT_COLORS = ['#0f172a', '#1e293b', '#334155', '#0f766e', '#1d4ed8', '#4338ca', '#097969', '#374151'];
 const LINE_COLORS = ['#94a3b8', '#cbd5e1', '#a1a1aa', '#64748b', '#7dd3fc', '#86efac'];
 
-// الگو: [32 hex chars].[13 digits timestamp].[64 hex chars HMAC]
+// Pattern: [32 hex chars].[13 digits timestamp].[64 hex chars HMAC]
 const TOKEN_REGEX = /^[a-f0-9]{32}\.\d{13}\.[a-f0-9]{64}$/;
 
 export function resolveSecretKey(customSecret?: string): string {
   const secret = (customSecret || process.env.CAPTCHA_SECRET || process.env.AUTH_HMAC_KEY || '').trim();
   if (!secret) {
     throw new Error(
-      '[@persian-captcha-kit/server] CAPTCHA_SECRET is required. Please set it in options or via the CAPTCHA_SECRET environment variable.'
+      '[@persian-captcha-kit/server] CAPTCHA_SECRET is required. Please provide it via options or the CAPTCHA_SECRET environment variable.'
     );
   }
   if (secret.length < 32) {
@@ -63,10 +63,13 @@ function clamp(value: number, min: number, max: number, defaultValue: number): n
   return Math.max(min, Math.min(max, Math.round(value)));
 }
 
+/**
+ * Generates a random Persian numerical CAPTCHA with SVG markup and HMAC token.
+ */
 export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult {
   const secretKey = resolveSecretKey(options?.secret);
 
-  // اعتبارسنجی و محدودسازی ورودی‌ها برای جلوگیری از خطاهای حسابی و حملات DoS
+  // Validate and clamp configuration values to prevent arithmetic errors and DoS attacks
   const width = clamp(options?.width ?? 200, 120, 600, 200);
   const height = clamp(options?.height ?? 54, 36, 200, 54);
   const ttlSeconds = clamp(options?.ttlSeconds ?? 180, 30, 900, 180);
@@ -78,7 +81,7 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
   }
   const code = digits.join('');
 
-  // ایجاد خطوط نویز تصادفی
+  // Generate random Bezier noise curves
   const lines: string[] = [];
   const lineCount = randomInt(3, 6);
   for (let i = 0; i < lineCount; i++) {
@@ -96,7 +99,7 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
     );
   }
 
-  // ایجاد نقاط نویز پراکنده
+  // Generate random scatter noise dots
   const dots: string[] = [];
   const dotCount = randomInt(25, 40);
   for (let i = 0; i < dotCount; i++) {
@@ -108,7 +111,7 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
     dots.push(`<circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}" opacity="${opacity}" />`);
   }
 
-  // رسم ارقام فارسی
+  // Render Persian digit characters
   const charElements: string[] = [];
   const paddingX = Math.floor(width * 0.12);
   const stepX = (width - paddingX * 2) / Math.max(charCount - 1, 1);
@@ -135,10 +138,10 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
   const backgroundDots = dots.slice(0, halfDots).join('');
   const foregroundDots = dots.slice(halfDots).join('');
 
-  // شناسه یکتا برای هر گرادیان تصویر جهت جلوگیری از تداخل ID در DOM
+  // Generate unique gradient ID to avoid collisions when multiple SVGs render on the same page
   const gradientId = `pck-bg-${randomBytes(4).toString('hex')}`;
 
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="کد امنیتی کپچای فارسی">
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="Persian Captcha Code">
   <defs>
     <linearGradient id="${gradientId}" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#f8fafc" />
@@ -168,6 +171,9 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
   };
 }
 
+/**
+ * Validates a submitted captcha token and user input against replay and timing attacks.
+ */
 export async function verifyCaptchaToken(
   token: string | undefined | null,
   userInput: string | undefined | null,
@@ -180,7 +186,7 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_TOKEN' };
   }
 
-  // اعتبارسنجی سخت‌گیرانه ساختار توکن
+  // Strict token format validation
   if (!TOKEN_REGEX.test(token)) {
     return { valid: false, error: 'INVALID_TOKEN' };
   }
@@ -188,12 +194,12 @@ export async function verifyCaptchaToken(
   const [id, expStr, sig] = token.split('.');
   const exp = parseInt(expStr, 10);
 
-  // بررسی انقضا قبل از محاسبات سنگین‌تر
+  // Check expiration before further computation
   if (Date.now() > exp) {
     return { valid: false, error: 'EXPIRED' };
   }
 
-  // نرمال‌سازی ورودی ارقام کاربر
+  // Normalize user digits input (supports Persian, Arabic, and Western digits)
   const normalizedInput = toEnglishDigits(userInput)
     .replace(/[\s\-_]/g, '')
     .trim();
@@ -202,7 +208,7 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_FORMAT' };
   }
 
-  // بررسی اعتبار امضا با مقایسه زمان‌ثابت قبل از دستکاری حافظه
+  // Verify HMAC signature in constant time before mutating state
   const expectedHmac = createHmac('sha256', secretKey)
     .update(`${id}:${expStr}:${normalizedInput}`)
     .digest('hex');
@@ -221,7 +227,7 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_CODE' };
   }
 
-  // پس از احراز قطعی اصالت توکن و کد، عملیات ثبت اتمیک مصرف توکن (Replay Prevention) انجام می‌شود
+  // Atomically mark token as consumed to prevent replay attacks
   const ttlSeconds = Math.max(1, Math.ceil((exp - Date.now()) / 1000));
   const consumed = await store.markConsumed(id, ttlSeconds);
 
