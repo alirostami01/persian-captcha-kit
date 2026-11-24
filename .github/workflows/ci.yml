@@ -12,9 +12,20 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     strategy:
       matrix:
-        node-version: [20.x, 22.x, 24.x]
+        node-version: [22.x, 24.x, 26.x]
 
     steps:
       - name: Checkout repository
@@ -36,6 +47,9 @@ jobs:
         run: npm run build
 
       - name: Run Tests
+        env:
+          TEST_REDIS_PORT: 6379
+          REQUIRE_REDIS: 'true'
         run: npm test
 
       - name: Verify package tarball

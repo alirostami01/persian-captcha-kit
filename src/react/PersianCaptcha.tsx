@@ -112,6 +112,8 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef<number>(0);
+  const fetchCaptchaRef = useRef(fetchCaptcha);
+  fetchCaptchaRef.current = fetchCaptcha;
 
   const refreshCaptcha = useCallback(async () => {
     if (disabled) return;
@@ -130,8 +132,8 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
 
     try {
       let data: PersianCaptchaApiResponse;
-      if (fetchCaptcha) {
-        data = await fetchCaptcha(controller.signal);
+      if (fetchCaptchaRef.current) {
+        data = await fetchCaptchaRef.current(controller.signal);
       } else {
         const res = await fetch(apiEndpoint, {
           method: 'GET',
@@ -164,7 +166,7 @@ export const PersianCaptcha: React.FC<PersianCaptchaProps> = ({
         setIsLoading(false);
       }
     }
-  }, [apiEndpoint, disabled, fetchCaptcha, onCodeChange, onTokenChange]);
+  }, [apiEndpoint, disabled, onCodeChange, onTokenChange]);
 
   useEffect(() => {
     if (!token && !disabled) {
