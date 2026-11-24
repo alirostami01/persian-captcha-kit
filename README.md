@@ -155,6 +155,9 @@ const result = await verifyCaptchaToken(token, userInput, {
 });
 ```
 
+> [!NOTE]
+> The automated integration test suite verifies cluster behavior against a live multi-node Redis Cluster. The cluster topology verification test requires Redis 4.0+ (which introduced node IDs in `CLUSTER SLOTS`), and automatically uses `CLUSTER SHARDS` on Redis 7.0+. Normal runtime package usage with custom store adapters is version-agnostic and compatible with any Redis version supporting your chosen commands/Lua scripts.
+
 ---
 
 ### 3. Next.js App Router (`app/api/captcha/route.ts`)

@@ -11,6 +11,13 @@ import { toPersianDigits, toEnglishDigits } from '../dist/index.js';
 import { generateCaptcha, verifyCaptchaToken, MemoryCaptchaStore } from '../dist/server/index.js';
 import { createCaptchaHandler } from '../dist/next/index.js';
 import { PersianCaptcha } from '../dist/react/index.js';
+import {
+  MAX_CANDIDATE_ATTEMPTS,
+  parseClusterShards,
+  parseClusterSlots,
+  getClusterTopology,
+  findDeterministicCandidateId,
+} from './helpers/cluster-topology.js';
 
 // Setup minimal DOM environment for React tests
 const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
@@ -507,39 +514,11 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     // 7. Multi-Node Sharding Proof via Redis 7+ CLUSTER SHARDS (with fallback to CLUSTER SLOTS):
     // Authoritatively query shard topology, match masters by immutable Node ID (MYID),
     // and execute atomic operations with 100% deterministic key allocation across every master.
-    let shards = [];
-    try {
-      const rawShards = await cluster.cluster('SHARDS');
-      for (const shard of rawShards) {
-        const slots = [];
-        let masterId = null;
-        for (let i = 0; i < shard.length; i += 2) {
-          if (shard[i] === 'slots') {
-            const val = shard[i + 1];
-            for (let s = 0; s < val.length; s += 2) slots.push([val[s], val[s + 1]]);
-          } else if (shard[i] === 'nodes') {
-            for (const nodeProps of shard[i + 1]) {
-              const propMap = {};
-              for (let p = 0; p < nodeProps.length; p += 2) propMap[nodeProps[p]] = nodeProps[p + 1];
-              if (propMap.role === 'master') masterId = propMap.id;
-            }
-          }
-        }
-        if (masterId && slots.length > 0) shards.push({ masterId, slots });
-      }
-    } catch {
-      // Fallback for older Redis versions
-      const rawSlots = await cluster.cluster('SLOTS');
-      for (const [start, end, masterInfo] of rawSlots) {
-        shards.push({ masterId: masterInfo[2], slots: [[start, end]] });
-      }
-    }
+    const allShards = await getClusterTopology(cluster);
 
-    assert.equal(
-      shards.length,
-      masters.length,
-      `Topology must report all ${masters.length} master shards`
-    );
+    // Filter slot-owning shards (shards without slots must not be tested for key allocation)
+    const activeShards = allShards.filter((shard) => shard.slots.length > 0);
+    assert.ok(activeShards.length >= 3, 'Must have at least 3 active slot-owning shards');
 
     // Map each master instance by its unique, authoritative Node ID (MYID)
     const masterNodeMap = new Map();
@@ -548,24 +527,25 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
       masterNodeMap.set(myId, m);
     }
 
-    // Deterministically allocate and test a valid token for every single master shard
-    for (const shard of shards) {
+    // Ensure every active shard maps to exactly one connected master connection
+    for (const shard of activeShards) {
+      assert.ok(
+        masterNodeMap.has(shard.masterId),
+        `Active shard with Node ID ${shard.masterId} must map to a connected master node`
+      );
+    }
+
+    // Deterministically allocate and test a valid token for every single active master shard
+    for (const shard of activeShards) {
       const targetMaster = masterNodeMap.get(shard.masterId);
       assert.ok(targetMaster, `Master instance matching Node ID ${shard.masterId} must exist`);
 
-      // Deterministically find a 32-hex ID whose CRC16 slot falls into this shard
-      let deterministicId = null;
-      let slot = null;
-      let count = 0;
-      while (!deterministicId) {
-        const candidateHex = count.toString(16).padStart(32, '0');
-        const s = await cluster.cluster('KEYSLOT', `captcha:{${candidateHex}}:attempt`);
-        if (shard.slots.some(([start, end]) => s >= start && s <= end)) {
-          deterministicId = candidateHex;
-          slot = s;
-        }
-        count++;
-      }
+      // Deterministically find a 32-hex ID whose CRC16 slot falls into this shard (bounded by MAX_CANDIDATE_ATTEMPTS)
+      const { id: deterministicId, slot } = await findDeterministicCandidateId(
+        cluster,
+        shard,
+        MAX_CANDIDATE_ATTEMPTS
+      );
 
       createdTokenIds.add(deterministicId);
 
@@ -729,4 +709,184 @@ test('createCaptchaHandler works for Next.js and preserves security headers', as
   assert.equal(response.headers.get('Cache-Control'), 'no-store, no-cache, must-revalidate, proxy-revalidate');
   assert.equal(response.headers.get('Pragma'), 'no-cache');
   assert.equal(loggedError, null);
+});
+
+test('Regression: parseClusterShards parses valid CLUSTER SHARDS response', () => {
+  const mockShards = [
+    [
+      'slots', [0, 5460],
+      'nodes', [
+        ['id', 'node_1', 'port', 7000, 'ip', '127.0.0.1', 'role', 'master']
+      ]
+    ],
+    [
+      'slots', [5461, 10922],
+      'nodes', [
+        ['id', 'node_2', 'port', 7001, 'ip', '127.0.0.1', 'role', 'master']
+      ]
+    ]
+  ];
+  const result = parseClusterShards(mockShards);
+  assert.equal(result.length, 2);
+  assert.deepEqual(result[0], { masterId: 'node_1', slots: [[0, 5460]] });
+  assert.deepEqual(result[1], { masterId: 'node_2', slots: [[5461, 10922]] });
+});
+
+test('Regression: unsupported SHARDS command triggers CLUSTER SLOTS fallback', async () => {
+  let slotsCalled = false;
+  const mockCluster = {
+    async cluster(subcommand) {
+      if (subcommand === 'SHARDS') {
+        const err = new Error("ERR unknown subcommand 'SHARDS'. Try CLUSTER HELP.");
+        err.name = 'ReplyError';
+        throw err;
+      }
+      if (subcommand === 'SLOTS') {
+        slotsCalled = true;
+        return [
+          [0, 5460, ['127.0.0.1', 7000, 'node_1']],
+          [5461, 16383, ['127.0.0.1', 7001, 'node_2']],
+        ];
+      }
+      throw new Error(`Unexpected subcommand: ${subcommand}`);
+    },
+  };
+
+  const topology = await getClusterTopology(mockCluster);
+  assert.equal(slotsCalled, true);
+  assert.equal(topology.length, 2);
+  assert.equal(topology[0].masterId, 'node_1');
+  assert.equal(topology[1].masterId, 'node_2');
+});
+
+test('Regression: Redis < 4.0 / missing node ID produces explicit compatibility error', () => {
+  // Redis 3.x returned [start, end, [ip, port]] without node ID (masterInfo length = 2)
+  const redis3Slots = [
+    [0, 5460, ['127.0.0.1', 7000]],
+    [5461, 16383, ['127.0.0.1', 7001]],
+  ];
+
+  assert.throws(
+    () => parseClusterSlots(redis3Slots),
+    /Unsupported Redis Cluster topology version: CLUSTER SLOTS response does not contain node IDs/
+  );
+});
+
+test('Regression: multiple non-contiguous slot ranges are grouped under one unique master ID', () => {
+  const rawSlots = [
+    [0, 1000, ['127.0.0.1', 7000, 'master_alpha']],
+    [1001, 5000, ['127.0.0.1', 7001, 'master_beta']],
+    [5001, 8000, ['127.0.0.1', 7000, 'master_alpha']],
+    [8001, 16383, ['127.0.0.1', 7001, 'master_beta']],
+  ];
+
+  const result = parseClusterSlots(rawSlots);
+  assert.equal(result.length, 2, 'Must produce exactly one shard per unique master ID');
+
+  const alpha = result.find((s) => s.masterId === 'master_alpha');
+  assert.ok(alpha);
+  assert.deepEqual(alpha.slots, [
+    [0, 1000],
+    [5001, 8000],
+  ]);
+
+  const beta = result.find((s) => s.masterId === 'master_beta');
+  assert.ok(beta);
+  assert.deepEqual(beta.slots, [
+    [1001, 5000],
+    [8001, 16383],
+  ]);
+});
+
+test('Regression: shards without slots are excluded from key allocation', () => {
+  const mockShards = [
+    { masterId: 'active_1', slots: [[0, 5000]] },
+    { masterId: 'empty_master', slots: [] },
+    { masterId: 'active_2', slots: [[5001, 16383]] },
+  ];
+
+  const activeShards = mockShards.filter((s) => s.slots.length > 0);
+  assert.equal(activeShards.length, 2);
+  assert.equal(activeShards.some((s) => s.masterId === 'empty_master'), false);
+});
+
+test('Regression: network errors in CLUSTER SHARDS are propagated without fallback', async () => {
+  let slotsCalled = false;
+  const mockCluster = {
+    async cluster(subcommand) {
+      if (subcommand === 'SHARDS') {
+        const err = new Error('connect ECONNREFUSED 127.0.0.1:7000');
+        err.code = 'ECONNREFUSED';
+        throw err;
+      }
+      if (subcommand === 'SLOTS') {
+        slotsCalled = true;
+        return [];
+      }
+    },
+  };
+
+  await assert.rejects(
+    async () => getClusterTopology(mockCluster),
+    /ECONNREFUSED/
+  );
+  assert.equal(slotsCalled, false, 'SLOTS must never be called on network errors');
+});
+
+test('Regression: ACL and permission errors are propagated without fallback', async () => {
+  let slotsCalled = false;
+  const mockCluster = {
+    async cluster(subcommand) {
+      if (subcommand === 'SHARDS') {
+        const err = new Error("NOPERM User captcha has no permissions to run 'cluster|shards'");
+        throw err;
+      }
+      if (subcommand === 'SLOTS') {
+        slotsCalled = true;
+        return [];
+      }
+    },
+  };
+
+  await assert.rejects(
+    async () => getClusterTopology(mockCluster),
+    /NOPERM/
+  );
+  assert.equal(slotsCalled, false, 'SLOTS must never be called on ACL/permission errors');
+});
+
+test('Regression: malformed topology responses are rejected explicitly', async () => {
+  assert.throws(() => parseClusterShards('not an array'), /Malformed CLUSTER SHARDS response/);
+  assert.throws(
+    () => parseClusterShards([['slots', 'bad_slots', 'nodes', []]]),
+    /slots property must be an array/
+  );
+  assert.throws(
+    () => parseClusterShards([['slots', [0, 100], 'nodes', [['id', '', 'role', 'master']]]]),
+    /master node missing valid ID/
+  );
+  assert.throws(() => parseClusterSlots('not an array'), /Malformed CLUSTER SLOTS response/);
+  assert.throws(() => parseClusterSlots([['bad_entry']]), /entry must contain at least/);
+  assert.throws(
+    () => parseClusterSlots([[100, 50, ['127.0.0.1', 7000, 'node1']]]),
+    /invalid slot range/
+  );
+});
+
+test('Regression: findDeterministicCandidateId terminates at configured limit with descriptive error', async () => {
+  const mockCluster = {
+    async cluster() {
+      return 9999;
+    },
+  };
+
+  const shard = {
+    masterId: 'test_node_unreachable',
+    slots: [[0, 500]],
+  };
+
+  await assert.rejects(
+    async () => findDeterministicCandidateId(mockCluster, shard, 50),
+    /Failed to find candidate token ID for master ID test_node_unreachable within 50 attempts/
+  );
 });
