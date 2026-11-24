@@ -281,6 +281,15 @@ export async function verifyCaptchaToken(
   }
 
   if (!isCodeValid) {
+    // If this was the last allowed attempt, immediately burn/consume the token in store
+    if (attemptResult.attemptsRemaining === 0) {
+      try {
+        await store.markConsumed(id, ttlSeconds);
+      } catch {
+        // Ignored as attempt limit is already reached
+      }
+    }
+
     return {
       valid: false,
       error: 'INVALID_CODE',

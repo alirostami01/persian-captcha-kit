@@ -113,8 +113,9 @@ return {1, remaining, 0}
 
 const redisStore: CaptchaStore = {
   async recordAttempt(id: string, maxAttempts: number, ttlSeconds: number): Promise<StoreResult> {
-    const attemptKey = `captcha:attempt:${id}`;
-    const consumedKey = `captcha:consumed:${id}`;
+    // Uses Redis Hash Tags `{id}` to ensure both keys map to the same Hash Slot in Redis Cluster
+    const attemptKey = `captcha:{${id}}:attempt`;
+    const consumedKey = `captcha:{${id}}:consumed`;
 
     const [allowed, remaining, consumed] = (await redis.eval(
       RECORD_ATTEMPT_LUA,
@@ -133,7 +134,7 @@ const redisStore: CaptchaStore = {
   },
 
   async markConsumed(id: string, ttlSeconds: number): Promise<boolean> {
-    const consumedKey = `captcha:consumed:${id}`;
+    const consumedKey = `captcha:{${id}}:consumed`;
     const res = await redis.set(consumedKey, '1', 'EX', ttlSeconds, 'NX');
     return res === 'OK';
   },
@@ -207,9 +208,23 @@ toPersianDigits('123456'); // '۱۲۳۴۵۶'
 
 ---
 
-## Scope & Security Note
+## Scope & Security Architecture
 
-Persian Captcha Kit provides a cryptographically signed CAPTCHA challenge designed to distinguish humans from bots. It does not replace network-level rate limiting (e.g., Cloudflare, IP-based limits) or account-lockout policies. Always combine CAPTCHA verification with proper rate limiting on sensitive routes.
+### 1. CAPTCHA Scope
+Persian Captcha Kit provides a cryptographically signed CAPTCHA challenge designed to distinguish humans from automated scripts. It does not replace network-level rate limiting (e.g., Cloudflare, IP-based limits) or account-lockout policies. Always combine CAPTCHA verification with proper rate limiting on sensitive routes.
+
+### 2. Session Binding (Recommended for High-Security Endpoints)
+By default, captcha tokens are self-contained and stateless. If your threat model requires binding a CAPTCHA strictly to a specific user session or IP address to prevent token forwarding between clients:
+```typescript
+// Include session/user identifier in the HMAC secret derivation
+const sessionSecret = crypto
+  .createHmac('sha256', process.env.CAPTCHA_SECRET!)
+  .update(userSessionId)
+  .digest('hex');
+
+// Pass sessionSecret to generateCaptcha and verifyCaptchaToken
+const captcha = generateCaptcha({ secret: sessionSecret });
+```
 
 ---
 
