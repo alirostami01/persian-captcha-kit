@@ -42,8 +42,11 @@ const PERSIAN_DIGITS = ['۰', '۱', '۲', '۳', '۴', '۵', '۶', '۷', '۸', '�
 const TEXT_COLORS = ['#0f172a', '#1e293b', '#334155', '#0f766e', '#1d4ed8', '#4338ca', '#097969', '#374151'];
 const LINE_COLORS = ['#94a3b8', '#cbd5e1', '#a1a1aa', '#64748b', '#7dd3fc', '#86efac'];
 
-// Pattern: [32 hex chars].[13 digits timestamp].[64 hex chars HMAC]
-const TOKEN_REGEX = /^[a-f0-9]{32}\.\d{13}\.[a-f0-9]{64}$/;
+// Token structure: [32 hex id].[13 digits exp].[64 hex envelopeSig].[64 hex codeSig]
+const TOKEN_REGEX = /^[a-f0-9]{32}\.\d{13}\.[a-f0-9]{64}\.[a-f0-9]{64}$/;
+
+// Maximum allowable TTL in the future (15 minutes + 60s clock skew) to prevent future timestamp attacks
+const MAX_FUTURE_WINDOW_MS = (900 + 60) * 1000;
 
 export function resolveSecretKey(customSecret?: string): string {
   const secret = customSecret ?? process.env.CAPTCHA_SECRET ?? process.env.AUTH_HMAC_KEY;
@@ -70,7 +73,7 @@ function clamp(value: number, min: number, max: number, defaultValue: number): n
 }
 
 /**
- * Generates a random Persian numerical CAPTCHA with SVG markup and HMAC token.
+ * Generates a random Persian numerical CAPTCHA with SVG markup and dual-signed HMAC token.
  */
 export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult {
   const secretKey = resolveSecretKey(options?.secret);
@@ -159,10 +162,18 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
 
   const id = randomBytes(16).toString('hex');
   const exp = Date.now() + ttlSeconds * 1000;
-  const hmac = createHmac('sha256', secretKey);
-  hmac.update(`${id}:${exp}:${code}`);
-  const sig = hmac.digest('hex');
-  const token = `${id}.${exp}.${sig}`;
+
+  // 1. Envelope signature: Signs the authenticity of the token's ID and expiry (Independent of the user code)
+  const envelopeSig = createHmac('sha256', secretKey)
+    .update(`envelope:${id}:${exp}`)
+    .digest('hex');
+
+  // 2. Code signature: Signs the solution code bound to this envelope
+  const codeSig = createHmac('sha256', secretKey)
+    .update(`code:${id}:${exp}:${code}`)
+    .digest('hex');
+
+  const token = `${id}.${exp}.${envelopeSig}.${codeSig}`;
 
   return {
     token,
@@ -174,6 +185,7 @@ export function generateCaptcha(options?: GenerateCaptchaOptions): CaptchaResult
 
 /**
  * Validates a submitted captcha token and user input against replay, brute-force, and timing attacks.
+ * Authenticates token envelope authenticity BEFORE recording any attempt in the store.
  */
 export async function verifyCaptchaToken(
   token: string | undefined | null,
@@ -188,17 +200,44 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_TOKEN' };
   }
 
+  // 1. Strict regex validation for dual-signed format
   if (!TOKEN_REGEX.test(token)) {
     return { valid: false, error: 'INVALID_TOKEN' };
   }
 
-  const [id, expStr, sig] = token.split('.');
+  const [id, expStr, envelopeSig, codeSig] = token.split('.');
   const exp = parseInt(expStr, 10);
+  const now = Date.now();
 
-  if (Date.now() > exp) {
+  // 2. Bound expiration window: reject expired tokens or unreasonable future timestamps
+  if (now > exp) {
     return { valid: false, error: 'EXPIRED' };
   }
+  if (exp - now > MAX_FUTURE_WINDOW_MS) {
+    return { valid: false, error: 'INVALID_TOKEN' };
+  }
 
+  // 3. Authenticate the ENVELOPE first in constant time.
+  // If the envelope signature is forged, REJECT IMMEDIATELY without touching or polluting the Store.
+  const expectedEnvelopeHmac = createHmac('sha256', secretKey)
+    .update(`envelope:${id}:${expStr}`)
+    .digest('hex');
+
+  try {
+    const envelopeSigBuffer = Buffer.from(envelopeSig, 'hex');
+    const expectedEnvelopeBuffer = Buffer.from(expectedEnvelopeHmac, 'hex');
+
+    if (
+      envelopeSigBuffer.length !== expectedEnvelopeBuffer.length ||
+      !timingSafeEqual(envelopeSigBuffer, expectedEnvelopeBuffer)
+    ) {
+      return { valid: false, error: 'INVALID_TOKEN' };
+    }
+  } catch {
+    return { valid: false, error: 'INVALID_TOKEN' };
+  }
+
+  // 4. Validate user input format
   const normalizedInput = toEnglishDigits(userInput)
     .replace(/[\s\-_]/g, '')
     .trim();
@@ -207,9 +246,9 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'INVALID_FORMAT' };
   }
 
-  const ttlSeconds = Math.max(1, Math.ceil((exp - Date.now()) / 1000));
+  // 5. Authenticated envelope verified! Now safely record attempt in the store.
+  const ttlSeconds = Math.max(1, Math.ceil((exp - now) / 1000));
 
-  // Check attempt quota atomically in store before evaluating password hash
   let attemptResult;
   try {
     attemptResult = await store.recordAttempt(id, maxAttempts, ttlSeconds);
@@ -225,22 +264,23 @@ export async function verifyCaptchaToken(
     return { valid: false, error: 'TOO_MANY_ATTEMPTS', attemptsRemaining: 0 };
   }
 
-  // Verify HMAC signature in constant time
-  const expectedHmac = createHmac('sha256', secretKey)
-    .update(`${id}:${expStr}:${normalizedInput}`)
+  // 6. Verify the code HMAC signature
+  const expectedCodeHmac = createHmac('sha256', secretKey)
+    .update(`code:${id}:${expStr}:${normalizedInput}`)
     .digest('hex');
 
-  let isSignatureValid = false;
+  let isCodeValid = false;
   try {
-    const sigBuffer = Buffer.from(sig, 'hex');
-    const expectedBuffer = Buffer.from(expectedHmac, 'hex');
-    isSignatureValid =
-      sigBuffer.length === expectedBuffer.length && timingSafeEqual(sigBuffer, expectedBuffer);
+    const codeSigBuffer = Buffer.from(codeSig, 'hex');
+    const expectedCodeBuffer = Buffer.from(expectedCodeHmac, 'hex');
+    isCodeValid =
+      codeSigBuffer.length === expectedCodeBuffer.length &&
+      timingSafeEqual(codeSigBuffer, expectedCodeBuffer);
   } catch {
-    isSignatureValid = false;
+    isCodeValid = false;
   }
 
-  if (!isSignatureValid) {
+  if (!isCodeValid) {
     return {
       valid: false,
       error: 'INVALID_CODE',
@@ -248,7 +288,7 @@ export async function verifyCaptchaToken(
     };
   }
 
-  // Atomically mark token as completely consumed upon success
+  // 7. Mark token as fully consumed upon successful verification
   try {
     const consumed = await store.markConsumed(id, ttlSeconds);
     if (!consumed) {

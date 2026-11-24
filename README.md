@@ -11,9 +11,9 @@ A lightweight, zero-dependency, cryptographically secured Persian (Farsi) SVG Ca
 ## Highlights
 
 - **Zero Binary Dependencies:** Runs natively using standard `node:crypto`. No canvas, Cairo, or Python bindings required.
-- **HMAC Signed Tokens:** Employs HMAC-SHA256 tokens with mandatory secret validation (at least 32 bytes).
+- **Dual-Signed HMAC Tokens:** Validates token envelope authenticity (ID and expiration window) *before* recording verification attempts, preventing Store exhaustion by forged tokens.
 - **Brute-Force & Replay Protection:** Configurable maximum verification attempts (`maxAttempts`, defaults to 3) before a token is automatically burned.
-- **Pluggable Anti-Replay Store:** Includes a non-evicting memory store and supports custom distributed stores (e.g., Redis via atomic operations) for multi-instance environments.
+- **Pluggable Anti-Replay Store:** Includes a non-evicting memory store and supports custom distributed stores (e.g., Redis via atomic Lua scripts) for multi-instance environments.
 - **Timing-Safe:** Verified via `crypto.timingSafeEqual` to safeguard against timing attacks.
 - **Dynamic Noise:** Random Bezier curves, scattered dots, and unique SVG gradient IDs per image.
 - **Digit Normalization:** Handles Persian (`۰-۹`), Arabic (`٠-٩`), and Western (`0-9`) digits seamlessly.
@@ -48,7 +48,7 @@ const captcha = generateCaptcha({
 
 // Returns:
 // {
-//   token: '4a1b...29.1711234567.8f3a...',
+//   token: '4a1b...29.1711234567.8f3a....c92e...',
 //   svg: '<svg ...>...</svg>',
 //   code: '482910',
 //   expiresIn: 180
@@ -76,9 +76,9 @@ if (result.valid) {
 
 ---
 
-### 2. Distributed Store with Redis (ioredis / node-redis)
+### 2. Distributed Store with Redis (Atomic Lua Script)
 
-For clustered or multi-instance environments, implement the `CaptchaStore` interface:
+For clustered or multi-instance environments, implement `CaptchaStore` using an atomic Lua script to guarantee concurrency safety and avoid orphan keys:
 
 ```typescript
 import { verifyCaptchaToken, CaptchaStore, StoreResult } from 'persian-captcha-kit/server';
@@ -86,32 +86,55 @@ import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL);
 
+// Lua script for atomic attempt recording
+const RECORD_ATTEMPT_LUA = `
+local attemptKey = KEYS[1]
+local consumedKey = KEYS[2]
+local maxAttempts = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+
+if redis.call("EXISTS", consumedKey) == 1 then
+  return {0, 0, 1}
+end
+
+local count = redis.call("INCR", attemptKey)
+if count == 1 then
+  redis.call("EXPIRE", attemptKey, ttl)
+end
+
+if count > maxAttempts then
+  redis.call("SET", consumedKey, "1", "EX", ttl)
+  return {0, 0, 0}
+end
+
+local remaining = maxAttempts - count
+return {1, remaining, 0}
+`;
+
 const redisStore: CaptchaStore = {
   async recordAttempt(id: string, maxAttempts: number, ttlSeconds: number): Promise<StoreResult> {
-    const key = `captcha:attempt:${id}`;
-    // Atomically increment attempt count
-    const count = await redis.incr(key);
-    if (count === 1) {
-      await redis.expire(key, ttlSeconds);
-    }
+    const attemptKey = `captcha:attempt:${id}`;
+    const consumedKey = `captcha:consumed:${id}`;
 
-    const consumed = (await redis.get(`captcha:consumed:${id}`)) === '1';
-    if (consumed) {
-      return { allowed: false, attemptsRemaining: 0, consumed: true };
-    }
+    const [allowed, remaining, consumed] = (await redis.eval(
+      RECORD_ATTEMPT_LUA,
+      2,
+      attemptKey,
+      consumedKey,
+      maxAttempts,
+      ttlSeconds
+    )) as [number, number, number];
 
-    const allowed = count <= maxAttempts;
     return {
-      allowed,
-      attemptsRemaining: Math.max(0, maxAttempts - count),
-      consumed: !allowed,
+      allowed: allowed === 1,
+      attemptsRemaining: remaining,
+      consumed: consumed === 1,
     };
   },
 
   async markConsumed(id: string, ttlSeconds: number): Promise<boolean> {
-    const key = `captcha:consumed:${id}`;
-    // Atomic SET NX EX ensures single consumption across all server instances
-    const res = await redis.set(key, '1', 'EX', ttlSeconds, 'NX');
+    const consumedKey = `captcha:consumed:${id}`;
+    const res = await redis.set(consumedKey, '1', 'EX', ttlSeconds, 'NX');
     return res === 'OK';
   },
 };
@@ -186,7 +209,7 @@ toPersianDigits('123456'); // '۱۲۳۴۵۶'
 
 ## Scope & Security Note
 
-Persian Captcha Kit provides visual Turing challenge verification and cryptographic proof-of-work. It does not replace network-level rate limiting (e.g., Cloudflare, IP-based limits) or account-lockout policies. Always combine CAPTCHA verification with proper rate limiting on sensitive routes.
+Persian Captcha Kit provides a cryptographically signed CAPTCHA challenge designed to distinguish humans from bots. It does not replace network-level rate limiting (e.g., Cloudflare, IP-based limits) or account-lockout policies. Always combine CAPTCHA verification with proper rate limiting on sensitive routes.
 
 ---
 

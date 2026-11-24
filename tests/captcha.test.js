@@ -43,7 +43,7 @@ test('generateCaptcha enforces secret requirements and clamps parameters', () =>
   assert.match(clampedMax.svg, /viewBox="0 0 600 200"/);
 });
 
-test('generateCaptcha outputs valid SVG with unique gradient IDs', () => {
+test('generateCaptcha outputs valid SVG with unique gradient IDs and dual-signed token', () => {
   const c1 = generateCaptcha({ secret: TEST_SECRET });
   const c2 = generateCaptcha({ secret: TEST_SECRET });
 
@@ -53,6 +53,50 @@ test('generateCaptcha outputs valid SVG with unique gradient IDs', () => {
   assert.ok(idMatch1, 'Gradient ID exists in c1');
   assert.ok(idMatch2, 'Gradient ID exists in c2');
   assert.notEqual(idMatch1[1], idMatch2[1], 'Each SVG must have a distinct gradient ID');
+
+  // Verify dual-signed token structure: [id].[exp].[envelopeSig].[codeSig]
+  const parts = c1.token.split('.');
+  assert.equal(parts.length, 4, 'Token must contain 4 segments (id, exp, envelopeSig, codeSig)');
+});
+
+test('verifyCaptchaToken rejects forged envelope WITHOUT touching or polluting Store', async () => {
+  // Store with only 1 capacity entry
+  const store = new MemoryCaptchaStore({ maxEntries: 1 });
+  
+  // Fake token with forged envelope signature
+  const fakeToken = '1234567890abcdef1234567890abcdef.1999999999999.1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef.1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+  
+  // Submit 10 forged tokens
+  for (let i = 0; i < 10; i++) {
+    const res = await verifyCaptchaToken(fakeToken, '123456', { secret: TEST_SECRET, store });
+    assert.equal(res.valid, false);
+    assert.equal(res.error, 'INVALID_TOKEN');
+  }
+
+  // Store must still have its full capacity completely empty because forged tokens never entered it!
+  const validCaptcha = generateCaptcha({ secret: TEST_SECRET });
+  const validRes = await verifyCaptchaToken(validCaptcha.token, validCaptcha.code, {
+    secret: TEST_SECRET,
+    store,
+  });
+  assert.equal(validRes.valid, true, 'Store was not exhausted by forged tokens');
+});
+
+test('verifyCaptchaToken rejects unreasonable future expiry timestamps', async () => {
+  const store = new MemoryCaptchaStore();
+  const validCaptcha = generateCaptcha({ secret: TEST_SECRET });
+  const [id, , envSig, codeSig] = validCaptcha.token.split('.');
+
+  // Far future expiry (10 days in future)
+  const farFutureExp = Date.now() + 10 * 24 * 60 * 60 * 1000;
+  const futureToken = `${id}.${farFutureExp}.${envSig}.${codeSig}`;
+
+  const res = await verifyCaptchaToken(futureToken, validCaptcha.code, {
+    secret: TEST_SECRET,
+    store,
+  });
+  assert.equal(res.valid, false);
+  assert.equal(res.error, 'INVALID_TOKEN');
 });
 
 test('verifyCaptchaToken enforces maxAttempts and blocks brute-force guessing', async () => {
@@ -128,7 +172,6 @@ test('verifyCaptchaToken handles concurrent verification attempts safely', async
     verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
   ]);
 
-  // Exactly one attempt must succeed (valid: true) and the rest must be ALREADY_USED
   const successCount = results.filter((r) => r.valid).length;
   const alreadyUsedCount = results.filter((r) => r.error === 'ALREADY_USED').length;
 
