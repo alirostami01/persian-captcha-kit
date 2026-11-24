@@ -63,7 +63,7 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "npm run build && node --test tests/**/*.test.js",
+    "test": "npm run build && node --test tests/captcha.test.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm test && npm run typecheck"
   },

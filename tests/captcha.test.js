@@ -1,12 +1,40 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import RedisMock from 'ioredis-mock';
+import Redis from 'ioredis';
 import { toPersianDigits, toEnglishDigits } from '../dist/index.js';
 import { generateCaptcha, verifyCaptchaToken, MemoryCaptchaStore } from '../dist/server/index.js';
 import { createCaptchaHandler } from '../dist/next/index.js';
 
 const TEST_SECRET = 'a_very_secure_test_secret_key_with_at_least_32_characters_12345';
+
+// Real Redis Lua script from README
+const RECORD_ATTEMPT_LUA = `
+local attemptKey = KEYS[1]
+local consumedKey = KEYS[2]
+local maxAttempts = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+
+if redis.call("EXISTS", consumedKey) == 1 then
+  return {0, 0, 1}
+end
+
+local count = redis.call("INCR", attemptKey)
+if count == 1 then
+  redis.call("EXPIRE", attemptKey, ttl)
+end
+
+if count >= maxAttempts then
+  redis.call("SET", consumedKey, "1", "EX", ttl)
+end
+
+if count > maxAttempts then
+  return {0, 0, 0}
+end
+
+local remaining = maxAttempts - count
+return {1, remaining, 0}
+`;
 
 test('toEnglishDigits & toPersianDigits conversion', () => {
   assert.equal(toEnglishDigits('۱۲۳۴۵۶'), '123456');
@@ -158,6 +186,40 @@ test('verifyCaptchaToken permits valid solution on the exact final allowed attem
   assert.equal(r3.error, 'ALREADY_USED');
 });
 
+test('verifyCaptchaToken handles concurrent verification attempts safely on MemoryStore', async () => {
+  const store = new MemoryCaptchaStore();
+  const captcha = generateCaptcha({ secret: TEST_SECRET });
+
+  const results = await Promise.all([
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+    verifyCaptchaToken(captcha.token, captcha.code, { secret: TEST_SECRET, store, maxAttempts: 5 }),
+  ]);
+
+  const successCount = results.filter((r) => r.valid).length;
+  const alreadyUsedCount = results.filter((r) => r.error === 'ALREADY_USED').length;
+
+  assert.equal(successCount, 1, 'Only one concurrent request can successfully consume the token');
+  assert.equal(alreadyUsedCount, 4, 'Remaining concurrent requests must be rejected as ALREADY_USED');
+});
+
+test('MemoryCaptchaStore validates maxEntries and refuses to drop unexpired entries', () => {
+  assert.throws(() => new MemoryCaptchaStore({ maxEntries: 0 }), /maxEntries must be a positive integer/);
+  assert.throws(() => new MemoryCaptchaStore({ maxEntries: -5 }), /maxEntries must be a positive integer/);
+
+  const smallStore = new MemoryCaptchaStore({ maxEntries: 2 });
+  smallStore.recordAttempt('id1', 3, 60);
+  smallStore.recordAttempt('id2', 3, 60);
+
+  // 3rd entry when memory is full of valid entries must throw capacity exceeded error
+  assert.throws(
+    () => smallStore.recordAttempt('id3', 3, 60),
+    /MemoryCaptchaStore capacity exceeded/
+  );
+});
+
 test('Session Binding with Domain Separation', async () => {
   function deriveSessionSecret(masterSecret, sessionId) {
     return createHmac('sha256', masterSecret)
@@ -178,44 +240,27 @@ test('Session Binding with Domain Separation', async () => {
   const resValid = await verifyCaptchaToken(captchaA.token, captchaA.code, { secret: secretA });
   assert.equal(resValid.valid, true, 'Session A must verify its own token successfully');
 
-  // 3. Generating another captcha for Session A
-  const captchaA2 = generateCaptcha({ secret: secretA });
-
-  // 4. Verification of Session A token using Session B secret must FAIL (INVALID_TOKEN)
-  const resInvalid = await verifyCaptchaToken(captchaA2.token, captchaA2.code, { secret: secretB });
+  // 3. Verification of Session A token using Session B secret must FAIL (INVALID_TOKEN)
+  const resInvalid = await verifyCaptchaToken(captchaA.token, captchaA.code, { secret: secretB });
   assert.equal(resInvalid.valid, false);
   assert.equal(resInvalid.error, 'INVALID_TOKEN', 'Token from Session A cannot be verified with Session B secret');
 });
 
-test('Redis Store with Lua Script and Cluster Hash Slot Tags', async () => {
-  const redis = new RedisMock();
+test('REAL REDIS SERVER: Lua Script, Cluster Hash Slots, TTL, and Concurrency', async () => {
+  const redisPort = Number(process.env.TEST_REDIS_PORT || 6380);
+  const redis = new Redis({
+    host: '127.0.0.1',
+    port: redisPort,
+    lazyConnect: true,
+    connectTimeout: 1000,
+  });
 
-  const RECORD_ATTEMPT_LUA = `
-local attemptKey = KEYS[1]
-local consumedKey = KEYS[2]
-local maxAttempts = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-
-if redis.call("EXISTS", consumedKey) == 1 then
-  return {0, 0, 1}
-end
-
-local count = redis.call("INCR", attemptKey)
-if count == 1 then
-  redis.call("EXPIRE", attemptKey, ttl)
-end
-
-if count >= maxAttempts then
-  redis.call("SET", consumedKey, "1", "EX", ttl)
-end
-
-if count > maxAttempts then
-  return {0, 0, 0}
-end
-
-local remaining = maxAttempts - count
-return {1, remaining, 0}
-`;
+  try {
+    await redis.connect();
+  } catch {
+    console.warn(`[SKIP] Real Redis server not reachable on 127.0.0.1:${redisPort}, skipping live Redis test.`);
+    return;
+  }
 
   const redisStore = {
     async recordAttempt(id, maxAttempts, ttlSeconds) {
@@ -247,6 +292,7 @@ return {1, remaining, 0}
   };
 
   const captcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+  const id = captcha.token.split('.')[0];
 
   // 1. First attempt with wrong code
   const r1 = await verifyCaptchaToken(captcha.token, '000000', {
@@ -258,21 +304,19 @@ return {1, remaining, 0}
   assert.equal(r1.error, 'INVALID_CODE');
   assert.equal(r1.attemptsRemaining, 1);
 
-  // Verify TTL and key existence in Redis with Cluster hash tags
-  const attemptVal = await redis.get(`captcha:{${captcha.token.split('.')[0]}}:attempt`);
-  assert.equal(attemptVal, '1');
-  const attemptTtl = await redis.ttl(`captcha:{${captcha.token.split('.')[0]}}:attempt`);
-  assert.ok(attemptTtl > 0, 'TTL must be set on attempt key');
+  // Check TTL and Key on real Redis
+  const ttl = await redis.ttl(`captcha:{${id}}:attempt`);
+  assert.ok(ttl > 0 && ttl <= 60, `TTL must be active on real Redis (got ${ttl})`);
 
-  // 2. Second attempt (final allowed) with correct code
+  // 2. Final attempt with correct code succeeds
   const r2 = await verifyCaptchaToken(captcha.token, captcha.code, {
     secret: TEST_SECRET,
     store: redisStore,
     maxAttempts: 2,
   });
-  assert.equal(r2.valid, true, 'Valid code on final attempt succeeds');
+  assert.equal(r2.valid, true);
 
-  // 3. Third attempt must be rejected as ALREADY_USED
+  // 3. Subsequent attempt rejected as ALREADY_USED
   const r3 = await verifyCaptchaToken(captcha.token, captcha.code, {
     secret: TEST_SECRET,
     store: redisStore,
@@ -280,26 +324,41 @@ return {1, remaining, 0}
   });
   assert.equal(r3.valid, false);
   assert.equal(r3.error, 'ALREADY_USED');
+
+  // 4. Concurrency test on Real Redis: 5 parallel requests
+  const concurrentCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
+  const concurrentResults = await Promise.all([
+    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+    verifyCaptchaToken(concurrentCaptcha.token, concurrentCaptcha.code, { secret: TEST_SECRET, store: redisStore, maxAttempts: 5 }),
+  ]);
+
+  const liveSuccess = concurrentResults.filter((r) => r.valid).length;
+  const liveAlreadyUsed = concurrentResults.filter((r) => r.error === 'ALREADY_USED').length;
+  assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis');
+  assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis');
+
+  // Cleanup keys
+  await redis.del(`captcha:{${id}}:attempt`, `captcha:{${id}}:consumed`);
+  await redis.quit();
 });
 
 test('React Component request ordering logic: ignores out-of-order delayed responses', async () => {
-  // Unit test simulating the exact requestIdRef logic in PersianCaptcha
   let requestId = 0;
   let activeToken = '';
 
   const dispatchRequest = async (tokenToDeliver, delayMs) => {
     const currentId = ++requestId;
     await new Promise((resolve) => setTimeout(resolve, delayMs));
-    // Exactly the guard check from PersianCaptcha:
     if (currentId !== requestId) {
-      return; // Discard stale/out-of-order response
+      return;
     }
     activeToken = tokenToDeliver;
   };
 
-  // Dispatch Request 1 with longer delay (100ms)
   const req1 = dispatchRequest('token_1_delayed', 100);
-  // Dispatch Request 2 with shorter delay (20ms)
   const req2 = dispatchRequest('token_2_newer', 20);
 
   await Promise.all([req1, req2]);

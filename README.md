@@ -221,16 +221,26 @@ toPersianDigits('123456'); // '۱۲۳۴۵۶'
 Persian Captcha Kit provides a cryptographically signed CAPTCHA challenge designed to distinguish humans from automated scripts. It does not replace network-level rate limiting (e.g., Cloudflare, IP-based limits) or account-lockout policies. Always combine CAPTCHA verification with proper rate limiting on sensitive routes.
 
 ### 2. Session Binding (Recommended for High-Security Endpoints)
-By default, captcha tokens are self-contained and stateless. If your threat model requires binding a CAPTCHA strictly to a specific user session or IP address to prevent token forwarding between clients:
-```typescript
-// Include session/user identifier in the HMAC secret derivation
-const sessionSecret = crypto
-  .createHmac('sha256', process.env.CAPTCHA_SECRET!)
-  .update(userSessionId)
-  .digest('hex');
+By default, captcha tokens are self-contained and stateless. If your threat model requires binding a CAPTCHA strictly to a specific user session to prevent token forwarding between clients:
 
-// Pass sessionSecret to generateCaptcha and verifyCaptchaToken
+```typescript
+import { createHmac } from 'node:crypto';
+import { generateCaptcha, verifyCaptchaToken } from 'persian-captcha-kit/server';
+
+// Derive domain-separated secret from trusted server-side session (never client-provided input)
+function deriveSessionSecret(masterSecret: string, sessionId: string): string {
+  return createHmac('sha256', masterSecret)
+    .update(`persian-captcha-session:${sessionId}`)
+    .digest('hex');
+}
+
+// When generating:
+const sessionSecret = deriveSessionSecret(process.env.CAPTCHA_SECRET!, req.session.id);
 const captcha = generateCaptcha({ secret: sessionSecret });
+
+// When verifying:
+const verifySecret = deriveSessionSecret(process.env.CAPTCHA_SECRET!, req.session.id);
+const result = await verifyCaptchaToken(token, code, { secret: verifySecret });
 ```
 
 ---
