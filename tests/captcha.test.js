@@ -504,67 +504,85 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
     assert.equal(liveSuccess, 1, 'Only one concurrent request can succeed on real Redis Cluster');
     assert.equal(liveAlreadyUsed, 4, 'Remaining concurrent requests must be rejected by real Redis Cluster');
 
-    // 7. Multi-Node Sharding Proof via standard Redis CLUSTER SLOTS:
-    // Authoritatively query slot ranges and prove execution across EVERY master node
-    const rawClusterSlots = await cluster.cluster('SLOTS');
-    const getMasterForSlot = (slot) => {
-      for (const [start, end, masterInfo] of rawClusterSlots) {
-        if (slot >= start && slot <= end) {
-          return `${masterInfo[0]}:${masterInfo[1]}`;
+    // 7. Multi-Node Sharding Proof via Redis 7+ CLUSTER SHARDS (with fallback to CLUSTER SLOTS):
+    // Authoritatively query shard topology, match masters by immutable Node ID (MYID),
+    // and execute atomic operations with 100% deterministic key allocation across every master.
+    let shards = [];
+    try {
+      const rawShards = await cluster.cluster('SHARDS');
+      for (const shard of rawShards) {
+        const slots = [];
+        let masterId = null;
+        for (let i = 0; i < shard.length; i += 2) {
+          if (shard[i] === 'slots') {
+            const val = shard[i + 1];
+            for (let s = 0; s < val.length; s += 2) slots.push([val[s], val[s + 1]]);
+          } else if (shard[i] === 'nodes') {
+            for (const nodeProps of shard[i + 1]) {
+              const propMap = {};
+              for (let p = 0; p < nodeProps.length; p += 2) propMap[nodeProps[p]] = nodeProps[p + 1];
+              if (propMap.role === 'master') masterId = propMap.id;
+            }
+          }
         }
+        if (masterId && slots.length > 0) shards.push({ masterId, slots });
       }
-      return null;
-    };
-
-    const expectedMasterAddresses = new Set(
-      rawClusterSlots.map(([, , masterInfo]) => `${masterInfo[0]}:${masterInfo[1]}`)
-    );
-    assert.equal(
-      expectedMasterAddresses.size,
-      masters.length,
-      `CLUSTER SLOTS must account for all ${masters.length} master nodes`
-    );
-
-    // Collect representative valid captchas mapping to each distinct master node
-    const masterCaptchas = new Map();
-    let sampleAttempts = 0;
-    const maxSampleAttempts = 100;
-    while (masterCaptchas.size < expectedMasterAddresses.size && sampleAttempts < maxSampleAttempts) {
-      sampleAttempts++;
-      const candidateCaptcha = generateCaptcha({ secret: TEST_SECRET, ttlSeconds: 60 });
-      const candidateId = candidateCaptcha.token.split('.')[0];
-      const sAttempt = await cluster.cluster('KEYSLOT', `captcha:{${candidateId}}:attempt`);
-      const sConsumed = await cluster.cluster('KEYSLOT', `captcha:{${candidateId}}:consumed`);
-      assert.equal(sAttempt, sConsumed, 'Slot co-location must hold for attempt and consumed keys');
-
-      const masterAddr = getMasterForSlot(sAttempt);
-      assert.ok(masterAddr, `Master address must exist in CLUSTER SLOTS for slot ${sAttempt}`);
-
-      if (!masterCaptchas.has(masterAddr)) {
-        createdTokenIds.add(candidateId);
-        masterCaptchas.set(masterAddr, { id: candidateId, slot: sAttempt, masterAddr });
+    } catch {
+      // Fallback for older Redis versions
+      const rawSlots = await cluster.cluster('SLOTS');
+      for (const [start, end, masterInfo] of rawSlots) {
+        shards.push({ masterId: masterInfo[2], slots: [[start, end]] });
       }
     }
 
     assert.equal(
-      masterCaptchas.size,
-      expectedMasterAddresses.size,
-      `Must obtain representative keys for all ${expectedMasterAddresses.size} master nodes`
+      shards.length,
+      masters.length,
+      `Topology must report all ${masters.length} master shards`
     );
 
-    // Execute atomic Lua and physically verify key existence directly on each master node
-    for (const [masterAddr, { id, slot }] of masterCaptchas.entries()) {
-      const recordRes = await clusterStore.recordAttempt(id, 3, 60);
-      assert.equal(recordRes.allowed, true, `recordAttempt on ${masterAddr} (slot ${slot}) must succeed`);
+    // Map each master instance by its unique, authoritative Node ID (MYID)
+    const masterNodeMap = new Map();
+    for (const m of masters) {
+      const myId = await m.cluster('MYID');
+      masterNodeMap.set(myId, m);
+    }
+
+    // Deterministically allocate and test a valid token for every single master shard
+    for (const shard of shards) {
+      const targetMaster = masterNodeMap.get(shard.masterId);
+      assert.ok(targetMaster, `Master instance matching Node ID ${shard.masterId} must exist`);
+
+      // Deterministically find a 32-hex ID whose CRC16 slot falls into this shard
+      let deterministicId = null;
+      let slot = null;
+      let count = 0;
+      while (!deterministicId) {
+        const candidateHex = count.toString(16).padStart(32, '0');
+        const s = await cluster.cluster('KEYSLOT', `captcha:{${candidateHex}}:attempt`);
+        if (shard.slots.some(([start, end]) => s >= start && s <= end)) {
+          deterministicId = candidateHex;
+          slot = s;
+        }
+        count++;
+      }
+
+      createdTokenIds.add(deterministicId);
+
+      // Verify slot co-location for attempt and consumed keys
+      const sAttempt = await cluster.cluster('KEYSLOT', `captcha:{${deterministicId}}:attempt`);
+      const sConsumed = await cluster.cluster('KEYSLOT', `captcha:{${deterministicId}}:consumed`);
+      assert.equal(sAttempt, sConsumed, 'Slot co-location must hold for attempt and consumed keys');
+      assert.equal(sAttempt, slot);
+
+      // Execute atomic Lua on the cluster
+      const recordRes = await clusterStore.recordAttempt(deterministicId, 3, 60);
+      assert.equal(recordRes.allowed, true, `recordAttempt for slot ${slot} must succeed`);
       assert.equal(recordRes.attemptsRemaining, 2);
 
-      // Verify physical existence on this specific master instance
-      const targetMaster = masters.find(
-        (m) => `${m.options.host}:${m.options.port}` === masterAddr
-      );
-      assert.ok(targetMaster, `Master instance for ${masterAddr} must be in connected cluster nodes`);
-      const val = await targetMaster.get(`captcha:{${id}}:attempt`);
-      assert.equal(val, '1', `Key captcha:{${id}}:attempt must reside physically on master node ${masterAddr}`);
+      // Physically verify key existence on the authoritative master instance identified by Node ID
+      const val = await targetMaster.get(`captcha:{${deterministicId}}:attempt`);
+      assert.equal(val, '1', `Key must reside physically on master node ID ${shard.masterId} (slot ${slot})`);
     }
   } finally {
     // Guaranteed cleanup of all real keys in finally with isolated error handling per key
