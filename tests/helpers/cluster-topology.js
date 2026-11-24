@@ -71,11 +71,11 @@ export function parseClusterShards(rawShards) {
           const start = val[s];
           const end = val[s + 1];
           if (
-            typeof start !== 'number' ||
-            typeof end !== 'number' ||
+            !Number.isSafeInteger(start) ||
+            !Number.isSafeInteger(end) ||
             start < 0 ||
-            end > 16383 ||
-            start > end
+            start > end ||
+            end > 16383
           ) {
             throw new Error(`Malformed CLUSTER SHARDS response: invalid slot range [${start}, ${end}]`);
           }
@@ -134,8 +134,8 @@ export function parseClusterSlots(rawSlots) {
     const [start, end, masterInfo] = entry;
 
     if (
-      typeof start !== 'number' ||
-      typeof end !== 'number' ||
+      !Number.isSafeInteger(start) ||
+      !Number.isSafeInteger(end) ||
       start < 0 ||
       end > 16383 ||
       start > end
@@ -191,6 +191,45 @@ export async function getClusterTopology(cluster) {
 }
 
 /**
+ * Asserts an exact, bi-directional 1:1 match between connected master node instances
+ * and active slot-owning shards.
+ */
+export function assertMasterShardsExactMatch(masterNodeMap, activeShards) {
+  if (!masterNodeMap || !(masterNodeMap instanceof Map)) {
+    throw new Error('masterNodeMap must be a Map instance');
+  }
+  if (!Array.isArray(activeShards)) {
+    throw new Error('activeShards must be an array');
+  }
+
+  // 1. Shard count and master count must be strictly equal
+  if (masterNodeMap.size !== activeShards.length) {
+    throw new Error(
+      `Mismatch between connected masters (${masterNodeMap.size}) and active shards (${activeShards.length})`
+    );
+  }
+
+  const activeShardIdSet = new Set(activeShards.map((s) => s.masterId));
+  if (activeShardIdSet.size !== activeShards.length) {
+    throw new Error('Active shards contain duplicate master IDs');
+  }
+
+  // 2. Every active shard must match a connected master
+  for (const shard of activeShards) {
+    if (!masterNodeMap.has(shard.masterId)) {
+      throw new Error(`Active shard ${shard.masterId} has no corresponding connected master node`);
+    }
+  }
+
+  // 3. Every connected master must match an active shard (bi-directional)
+  for (const masterId of masterNodeMap.keys()) {
+    if (!activeShardIdSet.has(masterId)) {
+      throw new Error(`Connected master node ${masterId} has no corresponding active shard`);
+    }
+  }
+}
+
+/**
  * Deterministically finds a 32-character hexadecimal candidate ID
  * whose CRC16 hash slot falls within the slot ranges of the specified shard.
  * Bounded by maxAttempts (defaults to MAX_CANDIDATE_ATTEMPTS = 1_000_000).
@@ -200,6 +239,10 @@ export async function findDeterministicCandidateId(
   shard,
   maxAttempts = MAX_CANDIDATE_ATTEMPTS
 ) {
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts <= 0) {
+    throw new Error('maxAttempts must be a positive safe integer');
+  }
+
   let count = 0;
   while (count < maxAttempts) {
     const candidateHex = count.toString(16).padStart(32, '0');

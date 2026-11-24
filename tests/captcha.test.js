@@ -17,6 +17,7 @@ import {
   parseClusterSlots,
   getClusterTopology,
   findDeterministicCandidateId,
+  assertMasterShardsExactMatch,
 } from './helpers/cluster-topology.js';
 
 // Setup minimal DOM environment for React tests
@@ -527,13 +528,8 @@ test('PROVEN REAL REDIS CLUSTER: Multi-Node Sharding, Hash Slot Co-location, and
       masterNodeMap.set(myId, m);
     }
 
-    // Ensure every active shard maps to exactly one connected master connection
-    for (const shard of activeShards) {
-      assert.ok(
-        masterNodeMap.has(shard.masterId),
-        `Active shard with Node ID ${shard.masterId} must map to a connected master node`
-      );
-    }
+    // Ensure strict bi-directional 1:1 matching between connected masters and active shards
+    assertMasterShardsExactMatch(masterNodeMap, activeShards);
 
     // Deterministically allocate and test a valid token for every single active master shard
     for (const shard of activeShards) {
@@ -890,3 +886,109 @@ test('Regression: findDeterministicCandidateId terminates at configured limit wi
     /Failed to find candidate token ID for master ID test_node_unreachable within 50 attempts/
   );
 });
+
+test('Regression: slot range validation enforces Number.isSafeInteger on CLUSTER SHARDS and SLOTS', () => {
+  const invalidRanges = [
+    [NaN, 100],
+    [0, NaN],
+    [12.5, 100],
+    [0, 100.5],
+    [Infinity, 100],
+    [0, Infinity],
+    [-1, 100],
+    [0, 16384],
+    [500, 400],
+  ];
+
+  for (const [start, end] of invalidRanges) {
+    assert.throws(
+      () =>
+        parseClusterShards([
+          ['slots', [start, end], 'nodes', [['id', 'm1', 'port', 7000, 'role', 'master']]],
+        ]),
+      /invalid slot range/
+    );
+    assert.throws(
+      () =>
+        parseClusterSlots([
+          [start, end, ['127.0.0.1', 7000, 'm1']],
+        ]),
+      /invalid slot range/
+    );
+  }
+});
+
+test('Regression: findDeterministicCandidateId validates maxAttempts as positive safe integer', async () => {
+  const mockCluster = {
+    async cluster() {
+      return 0;
+    },
+  };
+  const shard = {
+    masterId: 'node_1',
+    slots: [[0, 100]],
+  };
+
+  const invalidVals = [0, -1, -100, 1.5, Infinity, -Infinity, NaN, '100', null];
+  for (const v of invalidVals) {
+    await assert.rejects(
+      async () => findDeterministicCandidateId(mockCluster, shard, v),
+      /maxAttempts must be a positive safe integer/
+    );
+  }
+});
+
+test('Regression: assertMasterShardsExactMatch enforces strict bi-directional 1:1 match', () => {
+  const masterMap = new Map([
+    ['n1', {}],
+    ['n2', {}],
+  ]);
+  const activeShards = [
+    { masterId: 'n1', slots: [[0, 5000]] },
+    { masterId: 'n2', slots: [[5001, 16383]] },
+  ];
+
+  // Valid 1:1 match
+  assert.doesNotThrow(() => assertMasterShardsExactMatch(masterMap, activeShards));
+
+  // Count mismatch: more masters than shards
+  assert.throws(
+    () =>
+      assertMasterShardsExactMatch(
+        new Map([['n1', {}], ['n2', {}], ['n3', {}]]),
+        activeShards
+      ),
+    /Mismatch between connected masters \(3\) and active shards \(2\)/
+  );
+
+  // Duplicate shard master IDs
+  assert.throws(
+    () =>
+      assertMasterShardsExactMatch(masterMap, [
+        { masterId: 'n1', slots: [[0, 1]] },
+        { masterId: 'n1', slots: [[2, 3]] },
+      ]),
+    /Active shards contain duplicate master IDs/
+  );
+
+  // Active shard has no connected master
+  assert.throws(
+    () =>
+      assertMasterShardsExactMatch(masterMap, [
+        { masterId: 'n1', slots: [[0, 1]] },
+        { masterId: 'n_missing', slots: [[2, 3]] },
+      ]),
+    /Active shard n_missing has no corresponding connected master node/
+  );
+
+  // Connected master has no active shard (mismatched master and shard IDs)
+  assert.throws(
+    () =>
+      assertMasterShardsExactMatch(
+        new Map([['n1', {}], ['n_unmatched', {}]]),
+        activeShards
+      ),
+    /Active shard n2 has no corresponding connected master node/
+  );
+});
+
