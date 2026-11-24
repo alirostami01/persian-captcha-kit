@@ -86,24 +86,31 @@ import Redis from 'ioredis';
 
 const redis = new Redis(process.env.REDIS_URL);
 
-// Lua script for atomic attempt recording
+// Lua script for atomic attempt recording and instant burning on final attempt
 const RECORD_ATTEMPT_LUA = `
 local attemptKey = KEYS[1]
 local consumedKey = KEYS[2]
 local maxAttempts = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 
+-- 1. Check if token was already burned or consumed
 if redis.call("EXISTS", consumedKey) == 1 then
   return {0, 0, 1}
 end
 
+-- 2. Atomically increment attempts
 local count = redis.call("INCR", attemptKey)
 if count == 1 then
   redis.call("EXPIRE", attemptKey, ttl)
 end
 
-if count > maxAttempts then
+-- 3. If count hits or exceeds maxAttempts, burn token immediately for subsequent requests
+if count >= maxAttempts then
   redis.call("SET", consumedKey, "1", "EX", ttl)
+end
+
+-- 4. Check if current attempt is allowed
+if count > maxAttempts then
   return {0, 0, 0}
 end
 

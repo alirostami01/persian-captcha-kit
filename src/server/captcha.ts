@@ -281,15 +281,6 @@ export async function verifyCaptchaToken(
   }
 
   if (!isCodeValid) {
-    // If this was the last allowed attempt, immediately burn/consume the token in store
-    if (attemptResult.attemptsRemaining === 0) {
-      try {
-        await store.markConsumed(id, ttlSeconds);
-      } catch {
-        // Ignored as attempt limit is already reached
-      }
-    }
-
     return {
       valid: false,
       error: 'INVALID_CODE',
@@ -299,9 +290,12 @@ export async function verifyCaptchaToken(
 
   // 7. Mark token as fully consumed upon successful verification
   try {
-    const consumed = await store.markConsumed(id, ttlSeconds);
-    if (!consumed) {
-      return { valid: false, error: 'ALREADY_USED', attemptsRemaining: 0 };
+    // If the token was not already burned during the final allowed attempt, mark it consumed now
+    if (attemptResult.attemptsRemaining > 0) {
+      const consumed = await store.markConsumed(id, ttlSeconds);
+      if (!consumed) {
+        return { valid: false, error: 'ALREADY_USED', attemptsRemaining: 0 };
+      }
     }
   } catch {
     return { valid: false, error: 'STORE_ERROR' };
